@@ -1,0 +1,1042 @@
+"""Stage 2 of PLAN_torsion_prediction_2026-09-11.md: a frozen DPA3 encoder.
+
+Every claim this workflow is adjudicated against was registered in context.toml
+on 2026-09-11, before any torsiondrive had been pulled.
+"""
+
+import sys as _sys
+
+_sys.path.insert(0, "/home/ben/code/claimcheck")
+from claimcheck.workflow import RULES as _CLAIMCHECK_RULES
+
+
+configfile: "config.yaml"
+
+
+DPA3 = "/home/ben/miniforge3/envs/dpa3/bin/python"
+NAGL = "/home/ben/miniforge3/envs/nagl/bin/python"
+MACE = "/home/ben/miniforge3/envs/al_mace/bin/python"
+ESPALOMA = "/home/ben/miniforge3/envs/espaloma/bin/python"
+OPENFE = "/home/ben/miniforge3/envs/openfe2/bin/python"
+
+
+rule torsiondrives:
+    """Cache the QCArchive records once: geometries, energies, connectivity.
+
+    QUESTION. None on its own. This is the fetch, separated from everything that
+    computes, so that a change to the model does not cost another pass over the
+    archive. 100 entries took about eight minutes; the XtalPi set is 8,737.
+
+    ON WHAT. The declared torsiondrive dataset at its `default` specification,
+    B3LYP-D3BJ/DZVP in Psi4. Every optimised geometry of every scan, with the
+    energy expressed relative to that scan's own minimum, because the offset
+    between molecules is not a quantity a torsion term is asked to predict.
+
+    COST. Network bound, about 5 seconds per entry. No GPU.
+    """
+    input:
+        script="pull_torsiondrives.py",
+    output:
+        npz="data/torsiondrives_{slug}_{limit}.npz",
+        quarantine="data/torsiondrives_{slug}_{limit}_quarantine.csv",
+    params:
+        dataset=lambda w: config["sources"][w.slug],
+        chunk=config.get("fetch_chunk", 200),
+    wildcard_constraints:
+        slug=r"[a-z0-9_]+",
+        limit=r"\d+",
+    log:
+        "logs/torsiondrives_{slug}_{limit}.log",
+    shell:
+        """
+        {DPA3} {input.script} \
+          --dataset {params.dataset:q} \
+          --limit {wildcards.limit} \
+          --chunk {params.chunk} \
+          --out {output.npz} \
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule embeddings:
+    """Per-atom DPA3 embeddings, one reference conformer per molecule.
+
+    QUESTION. Do frozen embeddings from a model pretrained on OpenLAM carry
+    enough torsion chemistry for a linear Fourier head to order a QM scan? A
+    Spearman against qm_rank whose interval excludes the constant control
+    answers it either way.
+
+    ON WHAT. The `limit` entries of the declared QCArchive torsiondrive dataset,
+    all at B3LYP-D3BJ/DZVP in Psi4. One row per scan point, 24 points per
+    molecule at 15 degree spacing; the independent unit is the MOLECULE.
+
+    HOW. DPA-3.1-3M, the shared descriptor of its 20 multi-task heads, read
+    through the SPICE2 head because that is the organic-molecule one. Embeddings
+    are taken from the lowest-energy conformer of each scan and reused across
+    that scan, so the bond representation is a property of the molecule and the
+    conformational dependence sits entirely in the phase. `--geometry per_point`
+    is the arm that measures what that choice costs.
+
+    CONTROLS. Declared in context.toml: `random` is dimension-matched Gaussian
+    coefficients through the same linear form, `constant` is the per-molecule
+    mean, `sage` is the OpenFF 2.x torsion term, and `echo` carries the QM rank
+    through the model's own indexing to catch a broken join.
+
+    UNITS. Embeddings are dimensionless, 128 per atom. One entry in the archive
+    is one molecule with its whole scan; nothing is averaged here.
+
+    COST. About 0.2 GPU-seconds per conformer measured on one RTX card, so a
+    100-molecule pull at one reference conformer each is under a minute of GPU
+    and is dominated by the QCArchive fetch.
+    """
+    input:
+        npz=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        script="dpa3_embeddings.py",
+    output:
+        npz="data/embeddings.npz",
+        quarantine="data/embeddings_quarantine.csv",
+    params:
+        checkpoint=config["checkpoint"],
+        model_config=config["model_config"],
+        head=config.get("head", "SPICE2"),
+        geometry=config.get("geometry", "reference"),
+        limit=config.get("limit", 0),
+    log:
+        "logs/embeddings.log",
+    shell:
+        """
+        {DPA3} {input.script} \
+          --torsiondrives {input.npz} \
+          --checkpoint {params.checkpoint} \
+          --config {params.model_config} \
+          --head {params.head} \
+          --geometry {params.geometry} \
+          --out {output.npz} \
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule fit:
+    """Fit the torsion phase head on frozen embeddings and write the tables it is judged on.
+
+    QUESTION. Do frozen DPA3 embeddings, a permutation-invariant phase and an
+    energy linear in that phase reproduce a QM torsion profile better than a
+    dimension-matched random control, a flat profile, and MMFF94? An interval on
+    the within-scan rank correlation that excludes the controls answers it either
+    way; one that spans them says this design could not tell.
+
+    ON WHAT. The cached torsiondrives and their embeddings. 24 points per scan,
+    one row per point, and the independent unit is the MOLECULE. The split is
+    over molecules and never over scan points.
+
+    HOW. Proper torsions enumerated from the archive's own connectivity; s_n over
+    n = 1..6; E = sum_n k_n . s_n summed over rotors; Adam on the mean squared
+    error in kcal^2/mol^2 over the training molecules.
+
+    CONTROLS. random (same architecture, coefficients from a Gaussian matched to
+    the fitted spread), constant (a flat profile, which must return unverifiable),
+    mmff94 (the classical standard at this stage).
+
+    UNITS. kcal/mol relative to each scan's own minimum. Correlations are over
+    ranks within a scan. One row of per_molecule.csv is one molecule.
+
+    COST. Minutes of CPU. The embeddings are already computed.
+    """
+    input:
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        embeddings="data/embeddings.npz",
+        script="fit_torsion_head.py",
+        model="/home/ben/code/openff-nagl/openff/nagl/torsion/model.py",
+        alpha="/home/ben/code/openff-nagl/openff/nagl/torsion/alpha.py",
+        tensors="/home/ben/code/openff-nagl/openff/nagl/utils/_tensors.py",
+    output:
+        profiles="data/profiles.csv",
+        per_molecule="data/per_molecule.csv",
+        figure="results/torsion_scatter.png",
+        profile_figure="results/torsion_profiles.png",
+        quarantine="data/fit_quarantine.csv",
+    params:
+        epochs=config.get("epochs", 600),
+        learning_rate=config.get("learning_rate", 0.003),
+        test_fraction=config.get("test_fraction", 0.25),
+        seed=config.get("seed", 20260911),
+    log:
+        "logs/fit.log",
+    shell:
+        """
+        {NAGL} {input.script} \
+          --torsiondrives {input.torsiondrives} \
+          --embeddings {input.embeddings} \
+          --profiles {output.profiles} \
+          --per-molecule {output.per_molecule} \
+          --figure {output.figure} \
+          --profile-figure {output.profile_figure} \
+          --quarantine {output.quarantine} \
+          --epochs {params.epochs} \
+          --learning-rate {params.learning_rate} \
+          --test-fraction {params.test_fraction} \
+          --seed {params.seed} > {log} 2>&1
+        """
+
+
+rule finetune:
+    """Frozen against fine-tuned DPA3, and reference-conformer against per-angle.
+
+    QUESTION. Stage 2 left the model beating a flat profile (19 of 23 held-out
+    molecules, p = 0.0026) and not beating MMFF94 (15 of 23, p = 0.210). Does
+    fine-tuning the encoder on the QM torsion data close that gap, and does the
+    encoder have to see the rotated geometries for it to? A paired difference over
+    held-out molecules whose interval excludes zero answers both either way.
+
+    ON WHAT. The same 100 cached torsiondrives, B3LYP-D3BJ/DZVP, 24 points per
+    scan, the same split by molecule, the independent unit the MOLECULE.
+
+    HOW. Three arms in one process so they cannot differ by the split: frozen,
+    fine-tuned on reference conformers, fine-tuned on every scan geometry. Head
+    initialisation, seed, epochs and head learning rate identical across all
+    three; the encoder learning rate is two orders of magnitude below the head's.
+
+    CONTROLS. MMFF94 and the flat profile are carried through unchanged, so an
+    arm that beats another still has to beat them.
+
+    UNITS. kcal/mol relative to each scan's own minimum. One row of the
+    per-molecule table is one molecule in one arm. Training seconds are measured
+    and written out, not estimated.
+
+    COST. About 3 s per epoch per arm for the per-angle arm on one card, from the
+    measured 41.6 ms per 24-point scan; the reference arms are 2.4 times cheaper.
+    """
+    input:
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        script="finetune_torsion.py",
+        helper="fit_torsion_head.py",
+        embedder="dpa3_embeddings.py",
+        model="/home/ben/code/openff-nagl/openff/nagl/torsion/model.py",
+        alpha="/home/ben/code/openff-nagl/openff/nagl/torsion/alpha.py",
+        tensors="/home/ben/code/openff-nagl/openff/nagl/utils/_tensors.py",
+    output:
+        profiles="data/profiles_arms.csv",
+        per_molecule="data/per_molecule_arms.csv",
+        quarantine="data/finetune_quarantine.csv",
+        history="results/loss.csv",
+        live_figure="results/training_curves.png",
+    params:
+        checkpoint=config["checkpoint"],
+        model_config=config["model_config"],
+        head=config.get("head", "SPICE2"),
+        epochs=config.get("finetune_epochs", 400),
+        head_lr=config.get("head_lr", 0.003),
+        encoder_lr=config.get("encoder_lr", 3e-5),
+        test_fraction=config.get("test_fraction", 0.25),
+        seed=config.get("seed", 20260911),
+        sampler=config.get("sampler", "scaffold"),
+        rotors=config.get("rotors", "driven"),
+        batch_size=config.get("batch_size", 32),
+        figure_every=config.get("figure_every", 25),
+    resources:
+        gpu=1,
+    log:
+        "logs/finetune.log",
+    shell:
+        """
+        {DPA3} {input.script} \\
+          --torsiondrives {input.torsiondrives} \\
+          --checkpoint {params.checkpoint} \\
+          --config {params.model_config} \\
+          --head {params.head} \\
+          --epochs {params.epochs} \\
+          --head-lr {params.head_lr} \\
+          --encoder-lr {params.encoder_lr} \\
+          --test-fraction {params.test_fraction} \\
+          --seed {params.seed} \\
+          --profiles {output.profiles} \\
+          --per-molecule {output.per_molecule} \\
+          --quarantine {output.quarantine} \\
+          --history {output.history} \\
+          --sampler {params.sampler} \\
+          --rotors {params.rotors} \\
+          --batch-size {params.batch_size} \\
+          --live-figure {output.live_figure} \\
+          --figure-every {params.figure_every} > {log} 2>&1
+        """
+
+
+rule pull_thira:
+    """One rsync of the cluster's training output. Nothing executes on thira.
+
+    Direction is cluster to here and nothing here is pushed back. The array wrote
+    `/work/ben/torsion_phase/runs/<arm>_fold<k>/` with loss.csv appended every
+    epoch and per_molecule.csv and profiles.csv at the end, so this can be run
+    mid-campaign to look at the curves and again at the end for the tables.
+    """
+    output:
+        stamp="logs/pull_thira.txt",
+    params:
+        remote="thira:/work/ben/torsion_phase/runs/",
+        local="results/thira/runs/",
+    shell:
+        "mkdir -p {params.local} && "
+        "rsync -a --info=stats2 {params.remote} {params.local} 2>&1 | tee {output.stamp} && "
+        "echo \"loss files: $(ls {params.local}/*/loss.csv 2>/dev/null | wc -l)\" >> {output.stamp} && "
+        "echo \"per-molecule files: $(ls {params.local}/*/per_molecule.csv 2>/dev/null | wc -l)\" >> {output.stamp}"
+
+
+rule thira_curves:
+    """Training curves for every fold and arm of the cluster campaign.
+
+    QUESTION. Is each arm learning or memorising, and did any fold fail silently?
+    A curve that flattens at the flat-profile control, or one that never appears,
+    answers it.
+
+    ON WHAT. The per-epoch loss files pulled from thira, 15 runs, 5 scaffold folds
+    by 3 arms on 870 OpenFF Gen3 molecules.
+
+    UNITS. Training MSE in kcal^2/mol^2, validation RMSE in kcal/mol, both
+    relative to each scan's own minimum. One line is one fold of one arm.
+
+    COST. Seconds of CPU.
+    """
+    input:
+        stamp="logs/pull_thira.txt",
+        script="plot_thira_curves.py",
+    output:
+        figure="results/thira_curves.png",
+        summary="results/thira_summary.csv",
+    log:
+        "logs/thira_curves.log",
+    shell:
+        "{NAGL} {input.script} --runs results/thira/runs "
+        "--figure {output.figure} --summary {output.summary} > {log} 2>&1"
+
+
+rule zeroshot:
+    """Pretrained potentials on the held-out benchmark, with no training at all.
+
+    QUESTION. What does a published organic potential already achieve on
+    TorsionNet500 under OUR protocol, before any head is fitted? That number is
+    the floor: a fitted head that does not clear it is subtracting, and it is the
+    only thing directly comparable to MACE-OFF23's published 0.25 kcal/mol mean
+    barrier error, because that figure is also a potential differencing conformer
+    energies.
+
+    ON WHAT. TorsionNet500, 500 drug-like fragments at B3LYP-D3BJ/DZVP, 24 points
+    per scan, relative to each scan's own minimum. Held out from every training
+    set here, and scoreable by an untrained method without leaking because there
+    is nothing to leak into.
+
+    HOW. MACE-OFF23 small, medium and large, float64, one single point per scan
+    geometry. Their pretraining is wB97M-D3(BJ)/def2-TZVPPD while the reference
+    here is B3LYP-D3BJ/DZVP, so an offset between the two levels of theory is
+    expected and is part of what is being measured rather than an error.
+
+    CONTROLS. The flat profile, in the same table.
+
+    UNITS. kcal/mol. `barrier_error` is |predicted range - QM range|, the
+    published metric; `rmse` is the whole profile, which is stricter. One row is
+    one molecule under one potential. Seconds per profile are measured.
+
+    COST. 500 molecules x 24 points x 3 models = 36,000 single points, tens of
+    minutes on one card.
+    """
+    input:
+        # Which cohort a tag scores. The comparison that matters is our fitted
+        # head against the zero-shot potential it is built on, and that is only
+        # a comparison if both are scored on the SAME molecules.
+        torsiondrives=lambda w: config["zeroshot_data"][w.tag],
+        script="zeroshot_baselines.py",
+    output:
+        per_molecule="data/zeroshot_{tag}_per_molecule.csv",
+        profiles="data/zeroshot_{tag}_profiles.csv",
+        quarantine="data/zeroshot_{tag}_quarantine.csv",
+    wildcard_constraints:
+        tag=r"[a-z0-9_]+",
+    params:
+        # One tag is one family of potentials, so MACE and DPA3 results do not
+        # overwrite each other and each can be rerun on its own.
+        potentials=lambda w: config["zeroshot_sets"][w.tag],
+        device=config.get("zeroshot_device", "cuda"),
+        interpreter=lambda w: config["zeroshot_interpreters"][w.tag],
+    resources:
+        gpu=1,
+    log:
+        "logs/zeroshot_{tag}.log",
+    shell:
+        """
+        # Triton needs ptxas and finds it on PATH. The interpreter is invoked
+        # directly rather than through an activated environment, so the env's
+        # own bin is not on PATH and Triton raises "Cannot find ptxas" even
+        # though the binary is sitting in al_mace/bin. Pointed at it explicitly
+        # rather than activating, so the rule still names the interpreter it runs.
+        export TRITON_PTXAS_PATH=/home/ben/miniforge3/envs/al_mace/bin/ptxas
+        export PATH=/home/ben/miniforge3/envs/al_mace/bin:$PATH
+        {params.interpreter} {input.script} \\
+          --torsiondrives {input.torsiondrives} \\
+          --potentials {params.potentials} \\
+          --device {params.device} \\
+          --per-molecule {output.per_molecule} \\
+          --profiles {output.profiles} \\
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+include: _CLAIMCHECK_RULES
+
+
+rule conformer_sensitivity:
+    """Can the model produce its profile from a SMILES string alone?
+
+    QUESTION. Every accuracy number in RESULT_stage3.md had the true dihedrals of
+    all 24 QM-optimised scan frames in hand; every cost number had one geometry
+    and rotated the phase in closed form. Enamine REAL and ZINC22 distribute
+    SMILES, not coordinates, so a precomputed torsional table and a docking
+    refinement both start from a generated conformer. What does that cost? A
+    median RMSE below 0.767 kcal/mol, the distance between two DFT references for
+    the same molecules, says the geometry does not matter; above the privileged
+    path's own 1.254 says the choice of conformer is now the dominant error.
+
+    ON WHAT. The held-out molecules of the merged pool, taken by the same
+    astartes scaffold split the published arms used, so the privileged number
+    here is comparable to the published one rather than merely similar. One
+    independent unit is one molecule.
+
+    HOW. Four geometry sources through one code path, differing only in which
+    geometry is embedded and which dihedrals are handed to the phase: the
+    published privileged path; the same QM minimum with the phase rotated in
+    closed form; an ETKDGv3 conformer built from the SMILES and minimised under
+    MMFF94s; and eight such conformers at distinct seeds for the spread.
+    Alignment is absolute, `phi_p = radians(grid_p) - phi_0`, because a generated
+    conformer sits at its own driven dihedral and comparing without this slides
+    two profiles past each other.
+
+    CONTROLS. Standard, the privileged arm, which is the published number. Random,
+    the QM minimum displaced by Gaussian noise at the measured median
+    ETKDG-to-QM heavy-atom RMSD: the same displacement with none of the
+    chemistry.
+
+    UNITS. kcal/mol. One number is the RMSE across 24 grid points between two
+    profiles of one molecule's driven bond, each relative to its own minimum.
+    Median over molecules, bootstrap resampled over molecules.
+
+    COST. One frozen-arm training run on the same split, then about eleven
+    encoder passes per held-out molecule at 18.4 ms each. Minutes on one card.
+    """
+    input:
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        script="conformer_sensitivity.py",
+        trainer="finetune_torsion.py",
+        helper="fit_torsion_head.py",
+        embedder="dpa3_embeddings.py",
+        model="/home/ben/code/openff-nagl/openff/nagl/torsion/model.py",
+        alpha="/home/ben/code/openff-nagl/openff/nagl/torsion/alpha.py",
+        tensors="/home/ben/code/openff-nagl/openff/nagl/utils/_tensors.py",
+    output:
+        out="data/conformer_sensitivity.csv",
+        profiles="data/conformer_sensitivity_profiles.csv",
+        quarantine="data/conformer_sensitivity_quarantine.csv",
+        figure="results/conformer_sensitivity.png",
+    params:
+        checkpoint=config["checkpoint"],
+        model_config=config["model_config"],
+        head=config.get("head", "SPICE2"),
+        epochs=config.get("finetune_epochs", 400),
+        conformers=config.get("conformers", 8),
+        seed=config.get("seed", 20260911),
+        limit=config.get("conformer_limit", 0),
+    resources:
+        gpu=1,
+    log:
+        "logs/conformer_sensitivity.log",
+    shell:
+        """
+        {DPA3} {input.script} \\
+          --torsiondrives {input.torsiondrives} \\
+          --checkpoint {params.checkpoint} \\
+          --config {params.model_config} \\
+          --head {params.head} \\
+          --epochs {params.epochs} \\
+          --conformers {params.conformers} \\
+          --limit {params.limit} \\
+          --seed {params.seed} \\
+          --out {output.out} \\
+          --profiles {output.profiles} \\
+          --quarantine {output.quarantine} \\
+          --figure {output.figure} > {log} 2>&1
+        """
+
+
+rule import_schrodinger:
+    """Bring a Schrodinger MLFF_test_data torsion set in as this project's npz.
+
+    QUESTION. None. A format conversion, kept apart from everything that
+    computes so that the scorers need no second input path.
+
+    ON WHAT. The json directories of github.com/leifjacobson/MLFF_test_data,
+    cloned once. TorsionTest2000 is 2,109 scans of 24 points covering B, Si, P
+    and the halogens with about a quarter of them ionic; TorsionNet500 is 500
+    scans with DLPNO-CCSD(T)/CBS beside wB97X-D3BJ/def2-TZVPD.
+
+    HOW. Energies from Hartree to kcal/mol relative to each scan's own minimum;
+    connectivity perceived from the LOWEST-energy frame's coordinates at the
+    stated net charge, so bond indices share the geometry's atom order.
+
+    UNITS. kcal/mol, Angstrom, degrees. One entry is one scan.
+
+    COST. Seconds per thousand scans, CPU.
+    """
+    input:
+        script="import_schrodinger_torsions.py",
+        directory=lambda w: config["schrodinger_sets"][w.set]["directory"],
+    output:
+        npz="data/test/{set}.npz",
+        quarantine="data/test/{set}_quarantine.csv",
+    params:
+        reference=lambda w: config["schrodinger_sets"][w.set]["reference"],
+        name=lambda w: config["schrodinger_sets"][w.set].get("name", w.set),
+    wildcard_constraints:
+        # Only the sets this project actually declares. A bare [a-z0-9_]+ also
+        # matched data/test/torsionnet500.npz, which is fetched from QCArchive
+        # by `torsiondrives` and not converted from Schrodinger json, so the DAG
+        # went looking for a config entry that does not exist and raised inside
+        # the input lambda.
+        set="|".join(sorted(config.get("schrodinger_sets", {}))) or "nothing",
+    log:
+        "logs/import_{set}.log",
+    shell:
+        """
+        {MACE} {input.script} \\
+          --directory {input.directory} \\
+          --reference '{params.reference}' \\
+          --dataset {params.name} \\
+          --out {output.npz} \\
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule cost:
+    """Seconds per molecule for a whole profile, on a named device.
+
+    QUESTION. What does one molecule's complete torsional profile cost, and does
+    that cost rise with the number of angles asked for? The head evaluates
+    s_n(phi) = R(n phi) s_n(0) in closed form, so the prediction is that the cost
+    is flat in angles and set entirely by the single encoder pass. A rise with
+    angles would refute it and would remove the only advantage this model has
+    over a pretrained potential.
+
+    ON WHAT. The first --n-molecules entries of the named cache, timed after a
+    warm-up. One number is one molecule's every rotatable bond at every angle.
+
+    HOW. The deployment path and only the deployment path: one encoder pass on
+    one geometry, then the phase rotated. Split into encoder-plus-head and
+    head-only, because the head-only figure is what a precomputed table costs to
+    query and the encoder figure is what building the table costs.
+
+    CONTROLS. The same molecules at 1, 24, 360 and 3,600 angles. Flat is the
+    prediction; the rows are the test of it.
+
+    UNITS. Seconds per molecule. The device is written into the table, since a
+    CPU number and a GPU number are not the same quantity and Fugaku has no GPUs.
+
+    COST. Under a minute on a GPU, minutes on CPU.
+    """
+    input:
+        script="cost_per_profile.py",
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        model="/home/ben/code/openff-nagl/openff/nagl/torsion/model.py",
+    output:
+        csv="data/cost_per_profile_{device}.csv",
+    params:
+        checkpoint=config["checkpoint"],
+        model_config=config["model_config"],
+        n_molecules=config.get("cost_molecules", 50),
+    wildcard_constraints:
+        device=r"(cpu|cuda)",
+    resources:
+        gpu=lambda w: 1 if w.device == "cuda" else 0,
+    log:
+        "logs/cost_{device}.log",
+    shell:
+        # CUDA_VISIBLE_DEVICES is emptied for the cpu measurement rather than
+        # trusting --device. deepmd puts the descriptor on its OWN global DEVICE,
+        # chosen at import, so --device cpu moved the head and left the encoder
+        # on the card: "mat1 is on cuda:0, different from other tensors on cpu".
+        # Hiding the card is the only way to make the whole forward pass CPU.
+        """
+        CUDA_VISIBLE_DEVICES=$(test {wildcards.device} = cpu && echo "" || echo "${{CUDA_VISIBLE_DEVICES:-0}}") \\
+        {DPA3} {input.script} \\
+          --torsiondrives {input.torsiondrives} \\
+          --n-molecules {params.n_molecules} \\
+          --device {wildcards.device} \\
+          --checkpoint {params.checkpoint} \\
+          --config {params.model_config} \\
+          --out {output.csv} > {log} 2>&1
+        """
+
+
+rule gates:
+    """The decision tree, with every criterion read from the project's outputs.
+
+    QUESTION. None. This draws the plan, so that what each test would decide is
+    written down before the test reports rather than after.
+
+    ON WHAT. The project's own result tables. A gate whose inputs are not on
+    disk is drawn as pending and says so; none of its numbers are typed in.
+
+    COST. Seconds, CPU.
+    """
+    input:
+        script="plot_gates.py",
+        accuracy="data/accuracy_cost.csv",
+    output:
+        figure="results/gates.png",
+    log:
+        "logs/gates.log",
+    shell:
+        "{MACE} {input.script} --root . --out {output.figure} > {log} 2>&1"
+
+
+rule optuna_summary:
+    """One row per completed trial of the hyperparameter search.
+
+    QUESTION. Is the error the architecture or the hyperparameters? Answered by
+    the gap between the best trial and the hand-chosen configuration, which is
+    enqueued INTO the study so both are measured on the same split, the same
+    epoch budget and the same validation set.
+
+    ON WHAT. The journal the distributed workers write on the cluster, copied
+    here. One row is one completed trial.
+
+    CONTROLS. The hand-chosen configuration, identified by its parameters rather
+    than its trial number, since a restarted study renumbers.
+
+    UNITS. Validation RMSE in kcal/mol at the search's epoch budget, which is
+    not the held-out test RMSE the arms report.
+
+    COST. A copy and a parse, seconds.
+    """
+    input:
+        script="optuna_summary.py",
+    output:
+        journal="data/optuna_study.journal",
+        csv="data/optuna_trials.csv",
+    params:
+        remote=config.get("optuna_journal",
+                          "thira:/work/ben/torsion_phase/optuna/study.journal"),
+    log:
+        "logs/optuna_summary.log",
+    shell:
+        """
+        rsync -a {params.remote} {output.journal} > {log} 2>&1
+        {DPA3} {input.script} \\
+          --journal {output.journal} \\
+          --out {output.csv} >> {log} 2>&1
+        """
+
+
+rule conformer_figure:
+    """Is the flattening in the run's own figure one molecule or the mode?
+
+    QUESTION. A generated conformer reaches 1.650 kcal/mol against the
+    privileged path's 1.324, and one held-out molecule came back nearly flat
+    against a 5.5 kcal/mol QM barrier. An RMSE is reached equally by a model that
+    is right on average and by one that predicts nothing, so the slope of
+    predicted barrier against QM barrier is what separates them. Below 1 is
+    flattening, and a docking refinement that flattens every barrier will not
+    move a pose whatever its RMSE says.
+
+    ON WHAT. `data/conformer_sensitivity.csv`, one row per (molecule, geometry
+    source), 217 held-out molecules of the Gen3 cohort.
+
+    CONTROLS. The privileged source, whose slope is what the model does given
+    everything; and the noise source on the same axes.
+
+    UNITS. kcal/mol. One point is one molecule under one source.
+
+    COST. Seconds, CPU. Separate from the training rule so this cannot cost
+    another 35-minute run.
+    """
+    input:
+        script="plot_conformer.py",
+        table="data/conformer_sensitivity.csv",
+    output:
+        figure="results/conformer_geometry.png",
+        summary="data/conformer_barrier_slope.csv",
+    log:
+        "logs/conformer_figure.log",
+    shell:
+        """
+        {MACE} {input.script} \\
+          --table {input.table} \\
+          --figure {output.figure} \\
+          --summary {output.summary} > {log} 2>&1
+        """
+
+
+rule pull_supervision:
+    """Bring one supervision arm's table back from the cluster.
+
+    QUESTION. None. A transfer. The training itself is SLURM job 79364 on thira,
+    two GPU tasks, because 120 epochs over 11,700 training scans is about 15 h
+    per arm and the local card is not where that belongs.
+
+    WHY A PULL AND NOT A LOCAL RULE. An earlier version of this file trained
+    locally, which would have had the publish chain start a second 15-hour run
+    of work already queued on the cluster the moment `check_claims` asked for
+    the table. Two rules cannot produce one output, and the one that should is
+    the one that does not recompute what SLURM is already computing.
+
+    ON WHAT. `/work/ben/torsion_phase/supervision/{mode}/per_molecule.csv`,
+    written by `cluster/torsion_supervision.sbatch`. The sbatch carries the
+    question, the cohort, the controls and the epoch budget; this does not
+    restate them.
+
+    COST. A few MB over ssh.
+    """
+    output:
+        per_molecule="data/per_molecule_{mode}.csv",
+    params:
+        remote=lambda w: ("thira:/work/ben/torsion_phase/supervision/"
+                          f"{w.mode}/per_molecule.csv"),
+    wildcard_constraints:
+        mode=r"(scan|bond)",
+    log:
+        "logs/pull_supervision_{mode}.log",
+    shell:
+        """
+        rsync -a {params.remote} {output.per_molecule} > {log} 2>&1
+        """
+
+
+rule supervision_compare:
+    """The paired difference between the two supervision modes.
+
+    QUESTION, ON WHAT, HOW, CONTROLS, UNITS and COST are in the script's own
+    docstring, which this rule does not restate. The one thing that belongs
+    here: the join is on (molecule_id, driven_bond) and it is inner, so only
+    scans BOTH arms held out are compared, and the counts in and out are
+    printed. An arm that quietly held out different rows would otherwise look
+    better for having answered an easier question.
+    """
+    input:
+        script="compare_supervision.py",
+        scan="data/per_molecule_scan.csv",
+        bond="data/per_molecule_bond.csv",
+    output:
+        pairs="data/supervision_pairs.csv",
+    log:
+        "logs/supervision_compare.log",
+    shell:
+        """
+        {MACE} {input.script} \\
+          --scan {input.scan} \\
+          --bond {input.bond} \\
+          --out {output.pairs} > {log} 2>&1
+        """
+
+
+rule finetune_graph:
+    """The same head on espaloma's graph embedding instead of DPA3's descriptor.
+
+    QUESTION. Does a purpose-trained graph network carry torsion chemistry that a
+    pretrained atomistic descriptor does not, and what does the swap cost? The
+    head is unchanged, so the arms differ in the representation and nothing else.
+    Answered either way by held-out profile RMSE against the DPA3 arm on the same
+    split, and against espaloma 0.4.0's own published 1.18 kcal/mol on
+    TorsionNet500 (Clark et al., ChemRxiv 2026, Table 1).
+
+    WHY IT MIGHT WIN. espaloma 0.4.0 reaches 1.18 with a torsion readout whose
+    phase is FIXED to {0, pi}: "we do not fit phases and periodicities of
+    torsions as they are discrete". This head fits the phase continuously through
+    s_n, so the two differ in exactly one thing. And espaloma's embedding is a
+    function of the molecular graph alone, so k_n stops depending on which
+    conformer was in hand, which cost the DPA3 arm 0.326 kcal/mol on 2026-09-13
+    (1.324 to 1.650, intervals not overlapping).
+
+    ON WHAT. The same cached torsiondrives, the same split, the same seed as the
+    DPA3 arms. One independent unit is a molecule.
+
+    CONTROLS. The DPA3 arm on identical rows; MMFF94 and the flat profile carried
+    through both tables unchanged.
+
+    UNITS. kcal/mol relative to each scan's own minimum. Training seconds are
+    measured, not estimated: espaloma's stage 1 is 1.2 M parameters against
+    DPA-3.1-3M's 3 M, and 2.44 ms per molecule on CPU against 59.8 ms.
+
+    COST. About 1 s per epoch on 604 molecules, so minutes rather than the
+    DPA3 arm's 12.4 s per epoch.
+    """
+    input:
+        torsiondrives=lambda w: (
+            f"data/residual_gen3_{config['limit']}.npz" if w.target == "residual"
+            else f"data/torsiondrives_gen3_{config['limit']}.npz"),
+        script="finetune_torsion.py",
+        encoder="espaloma_encoder.py",
+        nagl="nagl_encoder.py",
+        helper="fit_torsion_head.py",
+        model="/home/ben/code/openff-nagl/openff/nagl/torsion/model.py",
+        alpha="/home/ben/code/openff-nagl/openff/nagl/torsion/alpha.py",
+    output:
+        profiles="data/profiles_{encoder}_{target}.csv",
+        per_molecule="data/per_molecule_{encoder}_{target}.csv",
+        quarantine="data/{encoder}_{target}_quarantine.csv",
+        history="results/loss_{encoder}_{target}.csv",
+    params:
+        version=lambda w: config.get("graph_encoder_version", {}).get(
+            w.encoder, "0.3.2"),
+        epochs=config.get("finetune_epochs", 400),
+        seed=config.get("seed", 20260911),
+        sampler=config.get("sampler", "scaffold"),
+        arms=config.get("espaloma_arms", "frozen,finetuned_reference"),
+    wildcard_constraints:
+        encoder=r"(espaloma|nagl|dpa3)",
+        target=r"(total|residual)",
+    resources:
+        gpu=1,
+    log:
+        "logs/finetune_{encoder}_{target}.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \
+          --torsiondrives {input.torsiondrives} \
+          --encoder {wildcards.encoder} \
+          --espaloma-version {params.version} \
+          --arms {params.arms} \
+          --epochs {params.epochs} \
+          --seed {params.seed} \
+          --sampler {params.sampler} \
+          --rotors driven \
+          --profiles {output.profiles} \
+          --per-molecule {output.per_molecule} \
+          --quarantine {output.quarantine} \
+          --history {output.history} > {log} 2>&1
+        """
+
+
+rule cost_stack:
+    """Seconds per molecule for every bond at N angles, by stack.
+
+    The question, the split into a parameter pass and a query, why a graph
+    encoder pays the pass once and an atomistic descriptor once per conformer,
+    the controls and the units are all in `cost_encoders.py`'s docstring, which
+    this rule does not restate. What belongs here: the three stacks live in
+    three environments that cannot share a process, so this is one invocation
+    each and the tables are merged afterwards rather than compared across a
+    boundary nobody measured.
+    """
+    input:
+        script="cost_encoders.py",
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        model="/home/ben/code/openff-nagl/openff/nagl/torsion/model.py",
+    output:
+        csv="data/cost_{stack}_{device}.csv",
+    params:
+        interpreter=lambda w: {"dpa3": DPA3, "espaloma": ESPALOMA,
+                               "espaloma_native": ESPALOMA}[w.stack],
+        n_molecules=config.get("cost_molecules", 50),
+        checkpoint=config["checkpoint"],
+        model_config=config["model_config"],
+    wildcard_constraints:
+        stack=r"(dpa3|espaloma|espaloma_native)",
+        device=r"(cpu|cuda)",
+    resources:
+        gpu=lambda w: 1 if w.device == "cuda" else 0,
+    log:
+        "logs/cost_{stack}_{device}.log",
+    shell:
+        """
+        CUDA_VISIBLE_DEVICES=$(test {wildcards.device} = cpu && echo "" || echo "${{CUDA_VISIBLE_DEVICES:-0}}") \\
+        {params.interpreter} {input.script} \\
+          --stack {wildcards.stack} \\
+          --torsiondrives {input.torsiondrives} \\
+          --n-molecules {params.n_molecules} \\
+          --device {wildcards.device} \\
+          --checkpoint {params.checkpoint} \\
+          --config {params.model_config} \\
+          --out {output.csv} > {log} 2>&1
+        """
+
+
+rule phase_census:
+    """How much of a real torsion profile is odd in the dihedral, and whose chemistry.
+
+    The question, the controls and why this is least squares rather than a model
+    comparison are in `phase_census.py`'s docstring. What belongs here: the
+    number it produces is a CEILING on what any phase-fitting architecture can
+    gain over any fixed-phase one, ours included, so a small answer closes the
+    question for every such model at once and a large one says which chemistry
+    is out of reach. It runs on the merged pool and both test sets together so
+    the named molecules can be found wherever they exist.
+
+    COST. Seconds, CPU, on data already on disk. No GPU.
+    """
+    input:
+        script="phase_census.py",
+        encoder="espaloma_encoder.py",
+        pool="data/pool_merged.npz",
+        tn500="data/test/torsionnet500.npz",
+        tt2000="data/test/torsiontest2000.npz",
+    output:
+        census="data/phase_census.csv",
+        named="data/phase_named.csv",
+        quarantine="data/phase_census_quarantine.csv",
+    log:
+        "logs/phase_census.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \\
+          --torsiondrives {input.pool} {input.tn500} {input.tt2000} \\
+          --out {output.census} \\
+          --named {output.named} \\
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule espaloma_phase_check:
+    """Does espaloma's TRAINED model produce the odd part, or only permit it?
+
+    The question, the metric and what this is not are in
+    `espaloma_phase_check.py`'s docstring. What belongs here: the phase census
+    showed a free phase buys 0.021 kcal/mol where a fixed-phase form provably
+    cannot reach it, which closes the ARCHITECTURE argument. It does not close
+    the empirical one, because espaloma's form spanning the odd component is not
+    the same as its trained network producing it, and nothing in its loss
+    singles the odd part out. This measures the difference.
+
+    COST. One espaloma forward per molecule, about 6 ms. No GPU needed.
+    """
+    input:
+        script="espaloma_phase_check.py",
+        census="phase_census.py",
+        encoder="espaloma_encoder.py",
+        pool="data/pool_merged.npz",
+    output:
+        csv="data/espaloma_phase_check.csv",
+        quarantine="data/espaloma_phase_quarantine.csv",
+    log:
+        "logs/espaloma_phase_check.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \\
+          --torsiondrives {input.pool} \\
+          --out {output.csv} \\
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule mm_baseline:
+    """Replace the target with the torsion RESIDUAL, E_QM - E_MM,no-torsion.
+
+    The reasoning, the charge model and why it is not a choice are in
+    `mm_baseline.py`'s docstring. What belongs here: the output is an npz in
+    this project's own cache format with `energy::key` replaced, so every rule
+    downstream reads it unchanged and an arm trained on it differs from the
+    current arms in the TARGET and in nothing else.
+
+    ON WHAT. The same cohort the published arms used.
+
+    CONTROLS. `--keep-torsions` produces the same file with Sage's own proper
+    torsions left in, so the residual is QM minus the FULL force field and what
+    comes out is Sage's own error on these molecules. That is the standard: a
+    head fitted to the residual has to beat leaving Sage's torsions in place.
+
+    UNITS. kcal/mol, both sides referenced to their own minimum before
+    subtracting so an arbitrary constant offset cannot enter.
+
+    COST. One Interchange per molecule, seconds each, CPU.
+    """
+    input:
+        script="mm_baseline.py",
+        encoder="espaloma_encoder.py",
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+    output:
+        npz="data/residual_gen3_{limit}.npz",
+        quarantine="data/residual_gen3_{limit}_quarantine.csv",
+    params:
+        forcefield=config.get("mm_baseline_forcefield", "openff-2.3.0.offxml"),
+    wildcard_constraints:
+        limit=r"\d+",
+    log:
+        "logs/mm_baseline_{limit}.log",
+    shell:
+        """
+        {OPENFE} {input.script} \\
+          --torsiondrives {input.torsiondrives} \\
+          --forcefield {params.forcefield} \\
+          --out {output.npz} \\
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule phased:
+    """Does a fitted phase help, with every other choice held identical?
+
+    The question, why it is per torsion rather than per bond, and why comparing
+    against espaloma as published would confound the phase with a different
+    training set are in `phased_torsion.py`'s docstring. What belongs here: the
+    unphased arm reproduces espaloma's functional form exactly, in this code,
+    on this data, with this optimiser, so the paired difference isolates one
+    thing. That is the comparison the phase census says is worth making and the
+    one nothing in the literature has run.
+
+    COST. espaloma's stage 1 is 1.4 ms per molecule on a card and the head is
+    tiny, so an epoch on 600 molecules is about a second.
+    """
+    input:
+        script="phased_torsion.py",
+        trainer="finetune_torsion.py",
+        encoder="espaloma_encoder.py",
+        torsiondrives=f"data/torsiondrives_gen3_{config['limit']}.npz",
+    output:
+        csv="data/phased_{encoder}_js{js}_{mode}.csv",
+        quarantine="data/phased_{encoder}_js{js}_{mode}_quarantine.csv",
+        checkpoint="data/phased_{encoder}_js{js}_{mode}.pt",
+    params:
+        version=lambda w: config.get("graph_encoder_version", {}).get(
+            w.encoder, "0.3.2"),
+        epochs=config.get("finetune_epochs", 400),
+        seed=config.get("seed", 20260911),
+        js=lambda w: float(w.js) / 100.0,
+        finetune=lambda w: ("--finetune-encoder"
+                            if w.mode == "finetuned" else ""),
+    wildcard_constraints:
+        encoder=r"(espaloma|nagl)",
+        js=r"\d+",
+        mode=r"(frozen|finetuned)",
+    resources:
+        gpu=1,
+    log:
+        "logs/phased_{encoder}_js{js}_{mode}.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \\
+          --torsiondrives {input.torsiondrives} \\
+          --encoder {wildcards.encoder} \\
+          --espaloma-version {params.version} \\
+          --epochs {params.epochs} \\
+          --seed {params.seed} \\
+          --js-weight {params.js} \
+          {params.finetune} \\
+          --checkpoint {output.checkpoint} \
+          --out {output.csv} \\
+          --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule pose_strain:
+    """Torsional strain of docked poses under each model, against pose accuracy.
+
+    Question, cohort, how each model is reduced to one scoring path, and why
+    absolute strain is not a truth signal are in `pose_strain.py`'s docstring.
+    """
+    input:
+        script="pose_strain.py",
+        poses="data/poses",
+    output:
+        csv="data/pose_strain.csv",
+        quarantine="data/pose_strain_quarantine.csv",
+    log:
+        "logs/pose_strain.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} --poses {input.poses} \\
+          --out {output.csv} --quarantine {output.quarantine} > {log} 2>&1
+        """

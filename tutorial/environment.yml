@@ -1,0 +1,15 @@
+# Everything the tutorial needs. No GPU, no torch, no deepmd, no DGL.
+# The census is least squares on QM energies; the heavy machinery in
+# ../workflow is for the model arms and is not used here.
+name: torsion-phase-tutorial
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - rdkit
+  - snakemake-minimal
+  - git

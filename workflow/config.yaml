@@ -1,0 +1,96 @@
+# Which QCArchive torsiondrive sets this project uses, and what each is FOR.
+# A slug maps to a dataset name so the pull rule takes its cohort as an argument
+# rather than containing it.
+#
+# THE SAGE FITTING SETS ARE ABSENT ON PURPOSE. "OpenFF SMIRNOFF Sage 2.0.0",
+# "2.1.0", "2.2.0" and "2.3.0" are the 4,674 torsiondrives Sage's own torsion
+# parameters were fitted to. Evaluating there would put the standard in-sample
+# and this model out, which flatters us for no reason.
+sources:
+  # training pool
+  gen3:          "OpenFF Gen3 Torsion Set v1.0"                             #   888
+  xtalpi:        "XtalPi 20-percent Fragments TorsiondriveDataset v1.0"      # 8,737
+  fragments2:    "OpenFF-benchmark-ligand-fragments-v2.0"                   # 8,052
+  fragments1:    "OpenFF-benchmark-ligand-fragments-v1.0"                   # 3,848
+  silicontx:     "SiliconTX Torsion Benchmark Set 1"                        # 1,459
+  protein_frags: "OpenFF Protein Fragments TorsionDrives v1.0"              #   845
+  group1:        "OpenFF Group1 Torsions"                                   #   820
+  # HELD OUT. The benchmark. Never trained on, never validated on.
+  torsionnet500: "TorsionNet500 Re-optimization TorsionDrives v4.0"         #   500
+
+test_source: torsionnet500
+
+# the cohort the current stage runs on
+dataset: "OpenFF Gen3 Torsion Set v1.0"
+limit: 100
+
+checkpoint: /home/ben/models/DPA-3.1-3M/DPA-3.1-3M.pt
+model_config: /home/ben/models/DPA-3.1-3M/input_pretrain.json
+head: SPICE2
+geometry: reference
+sampler: scaffold
+
+# Which central bonds carry the energy. `driven` keeps only the bond the scan
+# turned, which is the only reduction a torsiondrive identifies; `all` sums over
+# every central bond and is kept as the arm that measures what that cost.
+rotors: driven
+figure_every: 25
+
+# Zero-shot baselines. One tag is one family, because MACE lives in the al_mace
+# environment and DPA3 in dpa3, and they cannot share a process.
+zeroshot_sets:
+  mace: "mace_off23_small,mace_off23_medium,mace_off23_large"
+  dpa3: "dpa3:SPICE2"
+  dpa3_gen3: "dpa3:SPICE2"
+  dpa3_matched: "dpa3:SPICE2"
+  mace_matched: "mace_off23_large"
+  mace_gen3: "mace_off23_large"
+  mace_gen3_sm: "mace_off23_small,mace_off23_medium"
+  # G3, the expanded-element and ionic cohort. Both families on the same rows,
+  # because the question is which potential holds up where the training sets of
+  # both thin out, and that is only a comparison on identical molecules.
+  mace_tt2000: "mace_off23_small,mace_off23_large"
+  dpa3_tt2000: "dpa3:SPICE2"
+zeroshot_data:
+  mace: data/test/torsionnet500.npz
+  dpa3: data/test/torsionnet500.npz
+  dpa3_gen3: data/torsiondrives_gen3_888.npz
+  dpa3_matched: data/test/matched500.npz
+  mace_matched: data/test/matched500.npz
+  mace_gen3: data/torsiondrives_gen3_888.npz
+  mace_gen3_sm: data/torsiondrives_gen3_888.npz
+  mace_tt2000: data/test/torsiontest2000.npz
+  dpa3_tt2000: data/test/torsiontest2000.npz
+zeroshot_interpreters:
+  mace: /home/ben/miniforge3/envs/al_mace/bin/python
+  dpa3: /home/ben/miniforge3/envs/dpa3/bin/python
+  dpa3_gen3: /home/ben/miniforge3/envs/dpa3/bin/python
+  dpa3_matched: /home/ben/miniforge3/envs/dpa3/bin/python
+  mace_matched: /home/ben/miniforge3/envs/al_mace/bin/python
+  mace_gen3: /home/ben/miniforge3/envs/al_mace/bin/python
+  mace_gen3_sm: /home/ben/miniforge3/envs/al_mace/bin/python
+  mace_tt2000: /home/ben/miniforge3/envs/al_mace/bin/python
+  dpa3_tt2000: /home/ben/miniforge3/envs/dpa3/bin/python
+zeroshot_device: cuda
+
+# Schrodinger's public MLFF validation data, cloned from
+# github.com/leifjacobson/MLFF_test_data on 2026-09-13. The reference is
+# wB97X-D3BJ/def2-TZVPD, NOT the B3LYP-D3BJ/DZVP everything here trained on, so
+# any number computed against it carries a change of reference as well as a
+# change of cohort.
+schrodinger_root: /home/ben/data/torsion_external/MLFF_test_data
+schrodinger_sets:
+  torsiontest2000:
+    directory: /home/ben/data/torsion_external/MLFF_test_data/TorsionTest2000
+    reference: "E[wB97X-D3BJ/def2-TZVPD](Ha)"
+    name: TorsionTest2000
+  torsionnet500_schrodinger:
+    directory: /home/ben/data/torsion_external/MLFF_test_data/TorsionNet500
+    reference: "E[DLPNO-CCSD(T)/CBS](Ha)"
+    name: TorsionNet500-CCSDT
+
+# Which release each graph encoder loads. espaloma takes a version string,
+# NAGL a released model name; the same argument carries both.
+graph_encoder_version:
+  espaloma: "0.3.2"
+  nagl: "openff-gnn-am1bcc-1.0.0.pt"

@@ -1,0 +1,12 @@
+# Data is not in this repository. Every cohort it uses is public and fetchable:
+# QCArchive via workflow/pull_torsiondrives.py, THEMol via
+# workflow/fetch_hf_shards.py, Schrodinger's MLFF_test_data from GitHub.
+data/
+*.npz
+*.h5
+*.pt
+.snakemake/
+logs/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

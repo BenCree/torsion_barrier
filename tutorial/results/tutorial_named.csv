@@ -1,0 +1,13 @@
+name,smiles,expectation,present,n_scans,odd_fraction,minimum_shift_degrees,js_distance,power_n3,phase_gain,barrier_kcal_mol
+ethane,CC,"pure n=3, no odd part",0,0,,,,,,
+butane,CCCC,"anti and gauche, even",1,1,6.39474565068848e-10,0.0,8.322365904517137e-06,0.780730507467283,7.348336643168973e-08,5.304072782746516
+"1,2-difluoroethane",FCCF,"gauche preferred, electronic, even",0,0,,,,,,
+ethylene glycol,OCCO,"intramolecular H bond, gauche",0,0,,,,,,
+dimethoxymethane,COCOC,"ANOMERIC, gauche-gauche",0,0,,,,,,
+methanediol,OCO,"ANOMERIC, the minimal case",0,0,,,,,,
+2-methoxytetrahydropyran,COC1CCCCO1,"ANOMERIC, the textbook one",1,1,0.8131067150537341,119.33425797503469,0.6465695595436122,0.11990029444554061,2.402318068484098,9.581980794813717
+N-methylacetamide,CC(=O)NC,"amide, trans favoured",1,2,1.0753347569742749e-07,0.2496532593619918,0.0004514984701931351,0.013658143492775537,1.2947649752453362e-05,11.975467236799886
+biphenyl,c1ccccc1-c1ccccc1,"~44 degrees, even, 2-fold",1,1,1.8538594239437195e-06,83.38418862690708,0.0003490157451033994,1.7777572016990358e-06,3.0172863355118484e-05,2.204089856124483
+styrene,C=Cc1ccccc1,"planar, 2-fold",1,1,5.759929959800289e-06,23.46740638002774,0.0008577042715079516,4.165123543171013e-06,0.000761972731142261,3.112474314548308
+2-butanol,CC(O)CC,"stereocentre beside the rotor, odd expected",1,2,0.12392500954372718,62.662968099861274,0.16492961213052354,0.8497826780596596,0.5393978464015341,4.991788368555717
+fluoromethanol,OCF,"ANOMERIC, strongest simple case",0,0,,,,,,

@@ -1,0 +1,89 @@
+"""The tutorial workflow: three rules, no GPU, a few minutes.
+
+Fetch a public benchmark, convert it, and decompose every torsion profile in it
+into the symmetric part a force field can represent and the asymmetric part it
+cannot. The point of doing it on TorsionNet500 first is that the answer is
+almost exactly zero, which is the finding.
+"""
+
+WORKFLOW = "../workflow"
+DATA = config.get("data", "data")
+
+
+rule all:
+    input:
+        "results/tutorial_census.png",
+
+
+rule fetch:
+    """The benchmark, from its own repository. 598 MB, one clone.
+
+    Schrodinger's public MLFF validation data. TorsionNet500 is 500 rotamer
+    scans of drug-like fragments; TorsionTest2000 is 2,109 scans over an
+    expanded element set with some ionic examples.
+    """
+    output:
+        directory(f"{DATA}/MLFF_test_data"),
+    shell:
+        "git clone --depth 1 https://github.com/leifjacobson/MLFF_test_data "
+        "{output}"
+
+
+rule convert:
+    """Schrodinger json to the npz every rule here reads.
+
+    Energies from Hartree to kcal/mol relative to each scan's own minimum, and
+    connectivity perceived from the lowest-energy frame so bond indices share
+    the geometry's atom order.
+    """
+    input:
+        directory=f"{DATA}/MLFF_test_data",
+        script=f"{WORKFLOW}/import_schrodinger_torsions.py",
+    output:
+        npz=f"{DATA}/{{set}}.npz",
+        quarantine=f"{DATA}/{{set}}_quarantine.csv",
+    params:
+        folder=lambda w: {"torsionnet500": "TorsionNet500",
+                          "torsiontest2000": "TorsionTest2000"}[w.set],
+        reference=lambda w: ("E[DLPNO-CCSD(T)](Ha)" if w.set == "torsionnet500"
+                             else "E[wB97X-D3BJ/def2-TZVPD](Ha)"),
+    wildcard_constraints:
+        set="torsionnet500|torsiontest2000",
+    shell:
+        "python {input.script} --directory {input.directory}/{params.folder} "
+        "--reference '{params.reference}' --dataset {wildcards.set} "
+        "--out {output.npz} --quarantine {output.quarantine}"
+
+
+rule census:
+    """How much of each profile is the asymmetric kind, and whose chemistry.
+
+    Least squares in two bases on the same 24 points: with sine terms and
+    without. The difference is what a fitted phase buys, reported as kcal/mol,
+    as how far the predicted minimum moves, and as the Jensen-Shannon distance
+    between Boltzmann populations at 500 K.
+    """
+    input:
+        script=f"{WORKFLOW}/phase_census.py",
+        encoder=f"{WORKFLOW}/espaloma_encoder.py",
+        npz=expand(f"{DATA}/{{set}}.npz",
+                   set=["torsionnet500", "torsiontest2000"]),
+    output:
+        census="results/tutorial_census.csv",
+        named="results/tutorial_named.csv",
+        quarantine="results/tutorial_quarantine.csv",
+    shell:
+        "python {input.script} --torsiondrives {input.npz} "
+        "--out {output.census} --named {output.named} "
+        "--quarantine {output.quarantine}"
+
+
+rule figure:
+    """One figure: the distribution of asymmetry, by benchmark."""
+    input:
+        script="plot_tutorial.py",
+        census="results/tutorial_census.csv",
+    output:
+        figure="results/tutorial_census.png",
+    shell:
+        "python {input.script} --census {input.census} --figure {output.figure}"

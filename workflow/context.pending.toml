@@ -1,0 +1,151 @@
+# HELD BACK, NOT WITHDRAWN. Registered 2026-09-13 before any of this data
+# existed; paste back into context.toml when SLURM job 79364 has written
+# /work/ben/torsion_phase/supervision/{scan,bond}/per_molecule.csv and
+# `snakemake data/supervision_pairs.csv` has pulled and joined them.
+#
+# They are out of context.toml only because claimcheck requires every
+# declared file to exist before it will adjudicate ANY claim, and holding
+# nine verdicts hostage to a run that lands in fifteen hours publishes
+# nothing. S1 is claimed at 1.0 in order to be refuted: see its own
+# evidence.source.
+
+[[datasets]]
+id = "supervision_pairs"
+origin = "computed"
+files = ["data/supervision_pairs.csv"]
+title = "Scan supervision against bond supervision, paired on identical held-out scans"
+
+[[variables]]
+dataset = "supervision_pairs"
+name = "molecule_id"
+unit = "dimensionless"
+description = """The resampling unit. NOT the row: a molecule scanned at three
+rotors is three rows and one unit, and resampling rows would report an interval
+narrower than the data supports."""
+
+[[variables]]
+dataset = "supervision_pairs"
+name = "rmse_scan"
+unit = "kcal/mol"
+description = "Profile RMSE with each scan embedding its own reference geometry."
+
+[[variables]]
+dataset = "supervision_pairs"
+name = "rmse_bond"
+unit = "kcal/mol"
+description = """Profile RMSE with one embedding per molecule serving every bond
+that molecule was scanned at."""
+
+[[variables]]
+dataset = "supervision_pairs"
+name = "rmse_flat"
+unit = "kcal/mol"
+description = "The flat-profile control, identical in both arms by construction."
+
+[[variables]]
+dataset = "supervision_pairs"
+name = "qm_barrier_kcal_mol"
+unit = "kcal/mol"
+description = "The scan's range under B3LYP-D3BJ/DZVP."
+
+[[relationships]]
+id = "S1_per_bond_supervision_is_not_a_no_op"
+x = "supervision_pairs.rmse_bond"
+y = "supervision_pairs.rmse_scan"
+kind = "correlation"
+method = "spearman"
+claimed = 1.0
+resampling_unit = "molecule_id"
+evidence.source = """THIS ONE IS CLAIMED IN ORDER TO BE REFUTED, and says so
+before the data exists. If `--supervision bond` did nothing the two arms are the
+same model on the same split and this returns exactly 1.0 and agrees, which is
+how a flag that is parsed and then ignored passes every other test in the suite.
+A refutation is the evidence that the mode changed the model. It says nothing
+about which is better: that is the paired difference and the sign test, which
+`relate` cannot express and which `compare_supervision.py` reports beside this
+verdict."""
+evidence.locator = "data/supervision_pairs.csv :: rmse_bond, rmse_scan"
+
+[[relationships]]
+id = "K4_the_supervision_join_is_intact"
+x = "supervision_pairs.rmse_flat"
+y = "supervision_pairs.qm_barrier_kcal_mol"
+kind = "correlation"
+method = "spearman"
+claimed = 0.95
+resampling_unit = "molecule_id"
+evidence.source = """THE KNOWN ANSWER for the paired table, for the same reason
+as K3. Both columns come from the QM scan alone and are identical in the two
+arms by construction, so a low value means the inner join on (molecule_id,
+driven_bond) matched the wrong rows and the paired difference above it is
+meaningless."""
+evidence.locator = "data/supervision_pairs.csv :: rmse_flat, qm_barrier_kcal_mol"
+
+# ---------------------------------------------------------------------------
+
+[belief]
+
+# --------------------------------------------------------------------------
+# The espaloma-encoder arm. Registered 2026-09-13 before it ran, while the
+# DPA3 arms were the only ones that existed. The head is unchanged; only the
+# representation swaps.
+
+[[datasets]]
+id = "per_molecule_espaloma"
+origin = "computed"
+files = ["data/per_molecule_espaloma.csv"]
+title = "The torsion head on espaloma's graph embedding, one row per molecule and arm"
+
+[[variables]]
+dataset = "per_molecule_espaloma"
+name = "molecule_id"
+unit = "dimensionless"
+description = "The resampling unit."
+
+[[variables]]
+dataset = "per_molecule_espaloma"
+name = "rmse"
+unit = "kcal/mol"
+description = "Profile RMSE against QM, each relative to its own minimum."
+
+[[variables]]
+dataset = "per_molecule_espaloma"
+name = "rmse_flat"
+unit = "kcal/mol"
+description = "The flat-profile control, a function of the QM scan alone."
+
+[[relationships]]
+id = "E1_the_graph_embedding_carries_the_torsion"
+x = "per_molecule_espaloma.predicted_barrier_kcal_mol"
+y = "per_molecule_espaloma.qm_barrier_kcal_mol"
+kind = "correlation"
+method = "pearson"
+claimed = 0.85
+resampling_unit = "molecule_id"
+evidence.source = """THE PREDICTION, written before the arm ran. espaloma 0.4.0
+reaches 1.18 kcal/mol on TorsionNet500 with a torsion readout whose phase is
+fixed to {0, pi}, so its graph embedding demonstrably carries torsion chemistry;
+this head fits the phase continuously on top of that same embedding and should
+therefore track the barrier at least as well as the DPA3 arm does. 0.85 is
+claimed rather than 0.9 because the embedding is 512 features against DPA3's
+128 and the Janossy layer is four times wider on the same training set, which
+is a capacity change in the wrong direction for 604 molecules. Refuted downward
+means a graph network trained to emit MM parameters does not transfer to a
+phase head, and the pretrained atomistic descriptor was the right choice after
+all."""
+evidence.locator = "data/per_molecule_espaloma.csv :: predicted_barrier_kcal_mol, qm_barrier_kcal_mol"
+
+[[relationships]]
+id = "K5_the_espaloma_join_is_intact"
+x = "per_molecule_espaloma.rmse_flat"
+y = "per_molecule_espaloma.qm_barrier_kcal_mol"
+kind = "correlation"
+method = "spearman"
+claimed = 0.95
+resampling_unit = "molecule_id"
+evidence.source = """THE KNOWN ANSWER. Both columns come from the QM scan alone,
+so they are monotone in each other by construction and this must return near 1.
+It is what says a low E1 is a real null rather than a row mismatch between the
+espaloma graph build and the cached geometries, which is a live risk because the
+graph is built from connectivity while the profile comes from coordinates."""
+evidence.locator = "data/per_molecule_espaloma.csv :: rmse_flat, qm_barrier_kcal_mol"

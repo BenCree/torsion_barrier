@@ -1,0 +1,498 @@
+# ---------------------------------------------------------------------------
+# THE QUESTION
+# ---------------------------------------------------------------------------
+# Can a permutation-invariant torsion phase, on a pretrained DPA3 encoder, with
+# an energy linear in that phase, predict a QM torsion profile better than the
+# force field it would replace?
+#
+# Registered 2026-09-11, before any QCArchive data had been pulled and before
+# the dpa3 environment had finished building. Stage 2 of
+# PLAN_torsion_prediction_2026-09-11.md.
+#
+# ---------------------------------------------------------------------------
+# WHY THE ROWS ARE RANKS WITHIN A MOLECULE AND NOT ENERGIES
+# ---------------------------------------------------------------------------
+# A torsion scan is 24 points of ONE molecule. Correlating predicted against QM
+# energy pooled over molecules would mix the shape of each profile, which is the
+# thing being predicted, with the offset between molecules, which no torsion
+# term is asked to predict and which is set by everything else in the molecule.
+# Pooled that way a model that got every profile flat and every offset right
+# would look excellent.
+#
+# So every energy column is converted to a RANK WITHIN ITS OWN SCAN before it is
+# written, and the declared correlations are over those ranks. That is the same
+# device CLAUDE.md prescribes for a partial correlation: the quantity that is not
+# a correlation between two columns of one file is MADE one, in the rule that
+# writes the table rather than in the head of whoever reads it.
+#
+# The resampling unit is therefore the MOLECULE and never the scan point. 100
+# molecules at 24 points each is 2,400 rows and 100 independent units, and
+# quoting an interval resampled over rows would understate its width by about a
+# factor of five.
+#
+# RMSE in kcal/mol is not a correlation and cannot be a relationship here. It is
+# computed per molecule in `per_molecule.csv` and reported beside these verdicts,
+# which is the honest form rather than a workaround: RMSE is the standard this
+# project is measured against and the verdicts are the pre-registered part of it.
+#
+# ---------------------------------------------------------------------------
+# WHAT WOULD MAKE THE WHOLE TABLE WRONG
+# ---------------------------------------------------------------------------
+# A broken join between the model's output order and the QCArchive scan order.
+# It is silent: the profiles stay the right shape, they just belong to the wrong
+# molecules, and every correlation collapses toward zero in a way that looks like
+# an honest null. K1 exists to catch exactly that and nothing else.
+
+[project]
+name = "torsion_phase"
+title = "A permutation-invariant torsion phase on a pretrained DPA3 encoder, against QM profiles"
+context = """
+100 torsiondrives from QCArchive, split naively by molecule while the pipeline is
+being built and by scaffold with `astartes` once it is. Atom embeddings come from
+DPA-3.1-3M, frozen at this stage. The head is Janossy pooling over the proper
+torsions of each central bond, learned weights c_ij, a phase s_n over
+periodicities n = 1..6, and an energy linear in s_n so its coefficients are
+readable as force field torsion parameters.
+
+Two controls. `random` draws Fourier coefficients from a dimension-matched
+Gaussian and says whether the design resolves anything. `constant` predicts the
+per-molecule mean, so it has no profile at all and every within-scan rank ties;
+it must come back unverifiable rather than as a number, and a run in which it
+does not has a defect in the tie handling rather than a result.
+
+`sage` is the standard: the OpenFF 2.x torsion term is what a predicted parameter
+set would replace, so it is the arm that decides whether any of this is useful.
+"""
+
+# ---------------------------------------------------------------------------
+
+[[datasets]]
+id = "profiles"
+origin = "computed"
+files = ["data/profiles.csv"]
+title = "One row per scan point, every energy converted to a rank within its own scan"
+
+[[datasets]]
+id = "per_molecule"
+origin = "computed"
+files = ["data/per_molecule.csv"]
+title = "One row per molecule: profile RMSE and barrier error in kcal/mol, and cost"
+
+# ---------------------------------------------------------------------------
+
+[[variables]]
+dataset = "profiles"
+name = "molecule_id"
+unit = "dimensionless"
+description = "QCArchive record identifier. The resampling unit. Never averaged over."
+
+[[variables]]
+dataset = "profiles"
+name = "qm_rank"
+unit = "dimensionless"
+description = "Rank of the QM relative energy within this molecule's own scan, 1 = lowest."
+
+[[variables]]
+dataset = "profiles"
+name = "echo_rank"
+unit = "dimensionless"
+description = """The QM rank looked up by matching the grid angle written into
+this row against the cached grid, rather than by the position the prediction loop
+happened to be at. Identical to qm_rank when the ordering is intact and scrambled
+when it is not. Exists only for K1."""
+
+[[variables]]
+dataset = "profiles"
+name = "driven_dihedral_degrees"
+unit = "degree"
+description = """The dihedral of the driven torsion, COMPUTED from the stored
+geometry by calculate_dihedrals. An independent path to a quantity the archive
+also records."""
+
+[[variables]]
+dataset = "profiles"
+name = "grid_degrees"
+unit = "degree"
+description = """The dihedral torsiondrive constrained this geometry to, as
+recorded in the archive's own grid key."""
+
+[[variables]]
+dataset = "profiles"
+name = "driven_rank"
+unit = "dimensionless"
+description = "Rank of driven_dihedral_degrees within this molecule's own scan."
+
+[[variables]]
+dataset = "profiles"
+name = "grid_rank"
+unit = "dimensionless"
+description = "Rank of grid_degrees within this molecule's own scan."
+
+[[variables]]
+dataset = "profiles"
+name = "predicted_rank"
+unit = "dimensionless"
+description = "Rank of the predicted energy within this molecule's own scan."
+
+[[variables]]
+dataset = "profiles"
+name = "sage_rank"
+unit = "dimensionless"
+description = "Rank of the OpenFF 2.x torsion energy within this molecule's own scan."
+
+[[variables]]
+dataset = "profiles"
+name = "random_rank"
+unit = "dimensionless"
+description = """Rank of an energy built from dimension-matched Gaussian Fourier
+coefficients. Structurally matched to the model: same periodicities, same phase
+vectors, same linear form, only the coefficients are noise."""
+
+[[variables]]
+dataset = "profiles"
+name = "mmff94_rank"
+unit = "dimensionless"
+description = """Rank of the RDKit MMFF94 total energy within this molecule's own
+scan. The classical standard at stage 2, where it is available without an exact
+formal-charge assignment; Sage takes over at stage 4."""
+
+[[variables]]
+dataset = "profiles"
+name = "constant_rank"
+unit = "dimensionless"
+description = """Rank of the per-molecule mean energy, which is constant across a
+scan, so every rank within a molecule ties. Must return unverifiable."""
+
+[[variables]]
+dataset = "per_molecule"
+name = "rmse_predicted"
+unit = "kcal/mol"
+description = "Root mean square error of the predicted profile against QM, over this molecule's scan points."
+
+[[variables]]
+dataset = "per_molecule"
+name = "rmse_sage"
+unit = "kcal/mol"
+description = "The same for the OpenFF 2.x torsion term, on the same scan points."
+
+[[variables]]
+dataset = "per_molecule"
+name = "barrier_error_predicted"
+unit = "kcal/mol"
+description = """Absolute difference between the predicted and the QM barrier,
+each taken as the range of its own profile. The quantity the published
+TorsionNet-500 comparisons use, computed our way and labelled as ours."""
+
+[[variables]]
+dataset = "per_molecule"
+name = "seconds_per_profile"
+unit = "s"
+description = "Measured, not estimated, on a named card, for one 24-point profile."
+
+# ---------------------------------------------------------------------------
+# THE CLAIMS. Every `claimed` below was written before the data existed.
+# ---------------------------------------------------------------------------
+
+[[relationships]]
+id = "K1_the_join_is_intact"
+x = "profiles.echo_rank"
+y = "profiles.qm_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 1.0
+resampling_unit = "molecule_id"
+evidence.source = """THE KNOWN ANSWER. The same quantity reached two ways must
+correlate at exactly 1. Anything less means the model's output order and the
+QCArchive scan order disagree, and every other verdict in this file is then a
+statement about a shuffled table. Without this claim a broken join is
+indistinguishable from an honest null."""
+evidence.locator = "data/profiles.csv :: echo_rank, qm_rank"
+
+[[relationships]]
+id = "K2_the_geometry_carries_the_dihedral_the_archive_recorded"
+x = "profiles.driven_rank"
+y = "profiles.grid_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 1.0
+resampling_unit = "molecule_id"
+evidence.source = """THE SECOND KNOWN ANSWER, and the stronger of the two. The
+dihedral of the driven torsion computed from the stored geometry must equal the
+value torsiondrive constrained that geometry to. Two genuinely different paths:
+one through geomeTRIC's constrained optimisation and into the archive's grid key,
+one through our own calculate_dihedrals on the coordinates.
+
+Added 2026-09-11 after K1 as first implemented turned out to compute both sides
+from one array in one loop, so it could not have failed. This one can: it would
+catch a geometry-to-energy misalignment, a scan read in the wrong order, and a
+handedness error in the dihedral function, which is a defect that was actually
+present in this code until today and which no test here could have caught. Spot
+checked on 3 molecules by 24 points at 0.010 degrees before this claim was
+registered; this recomputes it on every molecule."""
+evidence.locator = "data/profiles.csv :: driven_rank, grid_rank"
+
+[[relationships]]
+id = "C1_random_coefficients_are_null"
+x = "profiles.random_rank"
+y = "profiles.qm_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 0.0
+resampling_unit = "molecule_id"
+evidence.source = """THE RANDOM CONTROL. Dimension-matched Gaussian coefficients
+through the same linear form. If this is not zero the design cannot resolve
+anything and no other number here means what it says. A refutation upward would
+most likely mean the phase vectors alone carry the profile, which would be a
+finding about s_n rather than about the model."""
+evidence.locator = "data/profiles.csv :: random_rank, qm_rank"
+
+[[relationships]]
+id = "C2_a_constant_profile_resolves_nothing"
+x = "profiles.constant_rank"
+y = "profiles.qm_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 0.0
+resampling_unit = "molecule_id"
+evidence.source = """THE DEGENERATE CONTROL. Every rank within a molecule ties, so
+the correlation is undefined and the verdict must be unverifiable rather than a
+number. This is a test of the adjudication as much as of the model: a tie scored
+as a wrong answer is one of the four defects that reached committed results on
+2026-08-22, and this claim would catch it recurring."""
+evidence.locator = "data/profiles.csv :: constant_rank, qm_rank"
+
+[[relationships]]
+id = "H1_the_model_tracks_the_qm_profile"
+x = "profiles.predicted_rank"
+y = "profiles.qm_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 0.85
+resampling_unit = "molecule_id"
+evidence.source = """THE PREDICTION. 0.85 is claimed because a frozen pretrained
+encoder with a fitted linear head should order the points of a scan well while
+getting the scale wrong, and rank correlation is insensitive to the scale.
+Refuted downward means the frozen embeddings do not carry torsion chemistry and
+stage 5 must fine-tune rather than freeze. Refuted upward on 100 molecules would
+be surprising and the first thing to check would be K1."""
+evidence.locator = "data/profiles.csv :: predicted_rank, qm_rank"
+
+[[relationships]]
+id = "B2_mmff94_is_the_stage_2_bar"
+x = "profiles.mmff94_rank"
+y = "profiles.qm_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 0.6
+resampling_unit = "molecule_id"
+evidence.source = """THE CLASSICAL STANDARD AT STAGE 2. MMFF94 is a 1996 force
+field with no torsiondrive fitting behind it, so 0.6 is claimed rather than
+Sage's 0.7. Added 2026-09-11, before any profile was computed, because Sage needs
+an exact OpenFF Molecule with bond orders and formal charges that the torsiondrive
+cache does not carry; B1 therefore runs at stage 4 with the full panel rather than
+here. The comparison that matters at stage 2 is H1 against this on the same rows."""
+evidence.locator = "data/profiles.csv :: mmff94_rank, qm_rank"
+
+[[relationships]]
+id = "B1_sage_is_the_bar"
+x = "profiles.sage_rank"
+y = "profiles.qm_rank"
+kind = "correlation"
+method = "spearman"
+claimed = 0.7
+resampling_unit = "molecule_id"
+evidence.source = """THE STANDARD. OpenFF 2.x torsion terms are fitted to QM
+torsiondrives of this kind, so they should do well; 0.7 is claimed rather than
+higher because these 100 molecules are drawn to include rotors the force field
+handles badly. This is the arm that decides usefulness: a model that beats random
+but not Sage has not earned a place in a force field, and the comparison that
+matters is H1 against B1 on the same rows, not either against zero."""
+evidence.locator = "data/profiles.csv :: sage_rank, qm_rank"
+evidence.note = """NOT COMPUTED AT STAGE 2. The column is produced at stage 4,
+where the full panel runs on TorsionNet500. Left registered rather than removed
+because the claim was written before any data existed and the prediction stands."""
+
+# ---------------------------------------------------------------------------
+# Registered 2026-09-13, BEFORE either file existed. The two blocks that
+# depend on `data/supervision_pairs.csv` are held in `context.pending.toml`
+# until SLURM job 79364 writes it, so that the nine claims whose data DOES
+# exist can be adjudicated and published tonight. Moving them back is a
+# paste, and the registration date is this line and the session log, not the
+# file they currently sit in. G3's zeroshot run was on
+# the card at the time of writing and `supervision_pairs` has no producing run
+# at all. Both carry a known-answer control beside the hypothesis, because
+# without one a null and a broken join look the same.
+
+[[datasets]]
+id = "zeroshot_tt2000"
+origin = "computed"
+files = ["data/zeroshot_mace_tt2000_per_molecule.csv"]
+title = "Pretrained potentials on TorsionTest2000: one row per molecule and potential"
+
+[[datasets]]
+id = "conformer_sensitivity"
+origin = "computed"
+files = ["data/conformer_sensitivity.csv"]
+title = "Profile RMSE by which geometry the head was given, one row per molecule and source"
+
+[[datasets]]
+id = "cost_cpu"
+origin = "computed"
+files = ["data/cost_per_profile_cpu.csv"]
+title = "Seconds per molecule for a whole profile on CPU, by path and number of angles"
+
+# ---------------------------------------------------------------------------
+
+[[variables]]
+dataset = "zeroshot_tt2000"
+name = "molecule_id"
+unit = "dimensionless"
+description = "The TorsionTest2000 testcase name. The resampling unit."
+
+[[variables]]
+dataset = "zeroshot_tt2000"
+name = "qm_barrier_kcal_mol"
+unit = "kcal/mol"
+description = """The scan's range under wB97X-D3BJ/def2-TZVPD, NOT the
+B3LYP-D3BJ/DZVP everything here trained on. The change of reference travels with
+every number computed from this file."""
+
+[[variables]]
+dataset = "zeroshot_tt2000"
+name = "predicted_barrier_kcal_mol"
+unit = "kcal/mol"
+description = "The potential's own range over the same 24 geometries."
+
+[[variables]]
+dataset = "zeroshot_tt2000"
+name = "rmse_flat"
+unit = "kcal/mol"
+description = """The flat-profile control: the RMS of the QM profile about its
+own minimum. A function of the scan alone, so it must track the barrier whatever
+the potential does."""
+
+[[variables]]
+dataset = "conformer_sensitivity"
+name = "molecule_id"
+unit = "dimensionless"
+description = "The resampling unit. Eight ETKDG rows per molecule share one."
+
+[[variables]]
+dataset = "conformer_sensitivity"
+name = "rmse_vs_qm"
+unit = "kcal/mol"
+description = """Profile RMSE against the QM scan, each relative to its own
+minimum. The `source` column says which geometry the head was given."""
+
+[[variables]]
+dataset = "conformer_sensitivity"
+name = "heavy_rmsd"
+unit = "angstrom"
+description = "Heavy-atom RMSD from the generated conformer to the QM minimum."
+
+[[variables]]
+dataset = "cost_cpu"
+name = "seconds_per_molecule"
+unit = "second"
+description = """One molecule's every rotatable bond at `n_angles` angles, timed
+after a warm-up. A CPU number and a GPU number are not the same quantity."""
+
+# ---------------------------------------------------------------------------
+
+[[relationships]]
+id = "G3_the_potentials_track_the_expanded_element_barriers"
+x = "zeroshot_tt2000.predicted_barrier_kcal_mol"
+y = "zeroshot_tt2000.qm_barrier_kcal_mol"
+kind = "correlation"
+method = "pearson"
+claimed = 0.9
+resampling_unit = "molecule_id"
+evidence.source = """THE PREDICTION, written 2026-09-13 while the run was on the
+card. MACE-OFF23 large reaches 0.441 kcal/mol profile RMSE on the Gen3 cohort,
+so on chemistry it knows it is close to the label uncertainty. TorsionTest2000
+is not that chemistry: 11 elements including B, Si and P, 114 ionic species, and
+a wB97X-D3BJ/def2-TZVPD reference rather than B3LYP-D3BJ/DZVP. 0.9 is claimed
+rather than 0.95 to allow for the change of reference. Refuted downward means
+the pretrained potentials do not transfer to the expanded element set, which is
+the one cohort where our head was ahead, and would make that lead worth
+believing. Refuted upward means the expanded elements are easier than feared and
+the lead was noise."""
+evidence.locator = "data/zeroshot_mace_tt2000_per_molecule.csv :: predicted_barrier_kcal_mol, qm_barrier_kcal_mol"
+
+[[relationships]]
+id = "K3_the_tt2000_join_is_intact"
+x = "zeroshot_tt2000.rmse_flat"
+y = "zeroshot_tt2000.qm_barrier_kcal_mol"
+kind = "correlation"
+method = "spearman"
+claimed = 0.95
+resampling_unit = "molecule_id"
+evidence.source = """THE KNOWN ANSWER. `rmse_flat` is the RMS of the QM profile
+about its own minimum and the barrier is its range, both computed from the same
+24 energies, so they are monotone in each other by construction and this must
+come back near 1. It is not a hypothesis: it is the check that says a low value
+for G3 is a real null and not a row mismatch between the converted npz and the
+scorer's output. Refuted downward means the join is broken and no other number
+from this file may be read."""
+evidence.locator = "data/zeroshot_mace_tt2000_per_molecule.csv :: rmse_flat, qm_barrier_kcal_mol"
+
+[[belief.nodes]]
+id = "torsion_phase"
+kind = "representation"
+status = "untested"
+label = "s_n, a permutation-invariant phase over the proper torsions of a central bond"
+
+[[belief.nodes]]
+id = "linear_fourier_head"
+kind = "method"
+status = "untested"
+label = "E = sum_n k_n . s_n, linear in the phase so k_n reads as a force field parameter"
+
+[[belief.nodes]]
+id = "dpa3_embeddings"
+kind = "representation"
+status = "published"
+label = "DPA-3.1-3M atom embeddings, pretrained on OpenLAM-v1, frozen at this stage"
+
+[[belief.nodes]]
+id = "periodicity_expansion"
+kind = "parameter"
+status = "by_construction"
+label = "n = 1..6, without which every three-fold rotor is degenerate and alpha undefined"
+
+[[belief.nodes]]
+id = "sage_torsions"
+kind = "method"
+status = "published"
+label = "OpenFF 2.x torsion terms, the standard a predicted parameter set would replace"
+
+[[belief.nodes]]
+id = "openlam_leakage"
+kind = "condition"
+status = "untested"
+label = "Whether OpenLAM-v1 contains the evaluation molecules, unmeasured as of 2026-09-11"
+
+[[belief.edges]]
+subject = "linear_fourier_head"
+predicate = "depends_on"
+object = "torsion_phase"
+
+[[belief.edges]]
+subject = "torsion_phase"
+predicate = "depends_on"
+object = "periodicity_expansion"
+
+[[belief.edges]]
+subject = "linear_fourier_head"
+predicate = "depends_on"
+object = "dpa3_embeddings"
+
+[[belief.edges]]
+subject = "linear_fourier_head"
+predicate = "is_validated_against"
+object = "sage_torsions"
+
+[[belief.edges]]
+subject = "dpa3_embeddings"
+predicate = "depends_on"
+object = "openlam_leakage"
