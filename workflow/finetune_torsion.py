@@ -996,6 +996,12 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--torsiondrives", required=True)
+    parser.add_argument(
+        "--external-test", default="",
+        help="a second cache, evaluated by every arm and trained on by none. "
+             "Molecules sharing an InChIKey with anything in --torsiondrives "
+             "are dropped and counted, so the benchmark cannot be contaminated "
+             "by the training pool it is being compared against.")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--config", default="")
     parser.add_argument("--head", default="SPICE2")
@@ -1123,6 +1129,28 @@ def main():
         print(f"split ({how}): {len(train_idx)} train, {len(val_idx)} validation, "
               f"{len(test_idx)} test molecules, of {len(prepared)}")
 
+    # ---- an external benchmark, evaluated by every arm and trained on by none
+    # WHY THE EXCLUSION IS BY InChIKey AND NOT BY molecule_id. The two caches
+    # were fetched from different QCArchive datasets and number their records
+    # independently, so identical molecules carry different ids; 50 of
+    # TorsionNet500's 497 are in this pool under other names. Comparing against
+    # a published benchmark while having trained on a tenth of it is the
+    # failure this guards, and it is silent without the check.
+    external_records = []
+    if args.external_test:
+        external_cache = np.load(args.external_test, allow_pickle=False)
+        external_prepared, _ = prepare(
+            external_cache, json.loads(str(external_cache["meta"])),
+            rotors=args.rotors, encoder=args.encoder)
+        seen = {m.get("inchi_key") for m in prepared if m.get("inchi_key")}
+        external_records = [m for m in external_prepared
+                            if m.get("inchi_key") not in seen]
+        print(f"external test {args.external_test}: "
+              f"{len(external_prepared)} prepared, "
+              f"{len(external_prepared) - len(external_records)} dropped for "
+              f"sharing an InChIKey with the training pool, "
+              f"{len(external_records)} evaluated")
+
     if args.encoder in GRAPH_ENCODERS:
         build_encoder = GRAPH_ENCODERS[args.encoder]()[0]
 
@@ -1156,6 +1184,7 @@ def main():
           f"{[a[0] for a in selected_arms]}, folds {[i for i, _ in selected_folds]}")
 
     results, timings, chosen, fold_of = {}, {}, {}, {}
+    external_reportable, external_keys = [], set()
     for fold_index, test_idx in selected_folds:
         if args.folds > 1:
             # Validation comes out of THIS fold's training portion, never out of
@@ -1166,6 +1195,15 @@ def main():
             train = [prepared[i] for i in train_idx]
             validation = [prepared[i] for i in val_idx]
             held_out = [prepared[i] for i in test_idx]
+        # Each fold trains a different model, so the external set is predicted
+        # once per fold under a fold-specific key rather than one fold's
+        # predictions silently overwriting another's in `results`.
+        for record in external_records:
+            copy = dict(record, key=f"ext{fold_index}::{record['key']}")
+            held_out = held_out + [copy]
+            external_reportable.append(copy)
+            external_keys.add(copy["key"])
+
         for molecule in held_out:
             for key in ([e["key"] for e in molecule["supervised"]] if per_bond
                         else [molecule["key"]]):
@@ -1207,11 +1245,14 @@ def main():
         ]
     else:
         reportable = prepared
+    reportable = list(reportable) + external_reportable
 
     for molecule in reportable:
         if molecule["key"] not in ran_keys:
             continue          # not held out by any fold this invocation ran
         split = "test"        # in k-fold every molecule is held out exactly once
+        cohort = ("external" if molecule["key"] in external_keys
+                  else "pool")
         fold = fold_of.get(molecule["key"], 0)
         qm = molecule["qm"]
         mmff = molecule["mmff"] if molecule["mmff"] is not None else np.full_like(qm, np.nan)
@@ -1223,7 +1264,8 @@ def main():
                 profile_rows.append(
                     {
                         "molecule_id": molecule["molecule_id"], "encoder": arm,
-                        "split": split, "fold": fold, "grid_degrees": angle,
+                        "split": split, "cohort": cohort,
+                        "fold": fold, "grid_degrees": angle,
                         "qm_kcal_mol": qm[point], "predicted_kcal_mol": predicted[point],
                         "qm_rank": ranks_within(qm)[point],
                         "predicted_rank": ranks_within(predicted)[point],
@@ -1232,7 +1274,7 @@ def main():
             molecule_rows.append(
                 {
                     "molecule_id": molecule["molecule_id"], "encoder": arm, "split": split,
-                    "fold": fold,
+                    "cohort": cohort, "fold": fold,
                     "inchi_key": molecule.get("inchi_key", ""),
                     "driven_bond": "-".join(str(b) for b in molecule.get("driven_bond", [])),
                     "smiles": molecule["smiles"], "n_atoms": molecule["n_atoms"],

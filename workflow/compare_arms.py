@@ -87,8 +87,14 @@ def before_after(per_molecule, path):
     from scipy.stats import binomtest
 
     _style()
-    figure, axes = plt.subplots(1, 3, figsize=(9.6, 3.4))
     arms = [a for a in ARM_STYLE if a in set(per_molecule["encoder"])]
+    # One panel for the totals and one per contrast against frozen. Allocating
+    # three regardless left an empty axes pair on every run with one contrast,
+    # which is what a reader takes for a missing result.
+    contrasts = [a for a in arms if a != "frozen"][:2]
+    figure, axes = plt.subplots(1, 1 + len(contrasts),
+                                figsize=(3.3 * (1 + len(contrasts)), 3.4))
+    axes = np.atleast_1d(axes)
 
     # a. total RMSE per arm and split, points not bars
     ax = axes[0]
@@ -102,27 +108,37 @@ def before_after(per_molecule, path):
             x = index + (offset - 0.5) * 0.34
             ax.scatter(np.full(len(subset), x) + np.random.default_rng(0).normal(0, 0.03, len(subset)),
                        subset["rmse"], s=7, lw=0, alpha=0.35, color=colour)
-            ax.scatter([x], [subset["rmse"].mean()], s=42, marker=marker,
+            ax.scatter([x], [subset["rmse"].median()], s=42, marker=marker,
                        facecolor=colour, edgecolor=BLACK, lw=0.7, zorder=5)
         positions.append(index)
         labels.append(ARM_STYLE[arm][1].replace(", ", "\n"))
+    # MEDIANS, BECAUSE MMFF94's MEAN IS NOT A SUMMARY OF ANYTHING. On the full
+    # pool its mean RMSE is 903.3 kcal/mol against a median of 1.866: RDKit's
+    # perception fails on phosphates and charged sugars and returns astronomic
+    # energies. Drawn as a mean it puts the axis limit at 800 and every real
+    # point on the zero line, which is how this panel read before.
     reference = per_molecule[per_molecule["split"] == "test"]
     if "rmse_mmff94" in reference and reference["rmse_mmff94"].notna().any():
-        ax.axhline(reference["rmse_mmff94"].dropna().mean(), color=VERMILLION,
-                   lw=0.9, ls="--", label="MMFF94, mean")
-    ax.axhline(reference["rmse_flat"].mean(), color=GREY, lw=0.9, ls=":",
-               label="flat profile, mean")
+        ax.axhline(reference["rmse_mmff94"].dropna().median(), color=VERMILLION,
+                   lw=0.9, ls="--", label="MMFF94, median")
+    ax.axhline(reference["rmse_flat"].median(), color=GREY, lw=0.9, ls=":",
+               label="flat profile, median")
+    ceiling = float(np.percentile(
+        per_molecule.loc[per_molecule["split"] == "test", "rmse"].dropna(), 99))
+    ax.set_ylim(0, max(ceiling, reference["rmse_flat"].median() * 1.2))
     ax.set_xticks(positions)
     ax.set_xticklabels(labels, fontsize=6.2)
     ax.set_ylabel("profile RMSE (kcal mol$^{-1}$)")
     _panel(ax, "a", "Total RMSE",
-           "one small point per molecule; large = mean. circle train, triangle test")
+           "one small point per molecule; large = median. circle train, triangle "
+           "test. axis clipped at the 99th percentile")
     ax.legend(loc="upper right")
 
     # b and c. paired change on held-out molecules
     base = per_molecule[(per_molecule["encoder"] == "frozen") & (per_molecule["split"] == "test")]
     base = base.set_index("molecule_id")
-    for index, arm in enumerate([a for a in arms if a != "frozen"][:2]):
+    paired = []
+    for index, arm in enumerate(contrasts):
         ax = axes[1 + index]
         after = per_molecule[
             (per_molecule["encoder"] == arm) & (per_molecule["split"] == "test")
@@ -136,6 +152,20 @@ def before_after(per_molecule, path):
         ax.set_xlim(0, limit); ax.set_ylim(0, limit); ax.set_aspect("equal", adjustable="box")
         wins = int((y < x).sum())
         p = binomtest(wins, len(shared), 0.5).pvalue if len(shared) else float("nan")
+        # The paired median CHANGE, resampled over molecules. Two separate
+        # medians with two separate intervals would measure the width of the
+        # pool; the arms share a split, so the difference is what to resample.
+        rng = np.random.default_rng(0)
+        d = (y - x).to_numpy(float)
+        d = d[np.isfinite(d)]
+        draws = np.median(d[rng.integers(0, d.size, size=(2000, d.size))], axis=1)
+        paired.append({
+            "arm": arm, "reference": "frozen", "n": len(shared), "wins": wins,
+            "win_fraction": wins / len(shared) if len(shared) else float("nan"),
+            "sign_test_p": p, "median_change": float(np.median(d)),
+            "change_lo": float(np.percentile(draws, 2.5)),
+            "change_hi": float(np.percentile(draws, 97.5)),
+        })
         ax.set_xlabel("frozen encoder, RMSE (kcal mol$^{-1}$)")
         ax.set_ylabel(f"{ARM_STYLE[arm][1]}, RMSE")
         _panel(ax, "bc"[index], ARM_STYLE[arm][1].capitalize(),
@@ -149,6 +179,7 @@ def before_after(per_molecule, path):
     pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path)
     plt.close(figure)
+    return paired
 
 
 def profiles_figure(profiles, per_molecule, path):
@@ -214,8 +245,9 @@ def main():
 
     if args.per_molecule and pathlib.Path(args.per_molecule).exists():
         per_molecule = pd.read_csv(args.per_molecule)
+        paired = []
         if args.before_after:
-            before_after(per_molecule, args.before_after)
+            paired = before_after(per_molecule, args.before_after) or []
         if args.profiles and args.profile_figure and pathlib.Path(args.profiles).exists():
             profiles_figure(pd.read_csv(args.profiles), per_molecule, args.profile_figure)
 
@@ -234,7 +266,26 @@ def main():
                 print(f"  {arm:22s} {split:10s} n={len(subset):3d}  "
                       f"RMSE mean {subset['rmse'].mean():6.3f} median {subset['rmse'].median():6.3f}"
                       f"  rho median {subset['rho'].median():+.3f}  kept epoch {epoch}")
+        for row in paired:
+            print(f"\n  PAIRED, {row['arm']} against {row['reference']} on the "
+                  f"same {row['n']} held-out molecules:")
+            print(f"    better on {row['wins']} of {row['n']} "
+                  f"({100 * row['win_fraction']:.1f}%), sign test p = "
+                  f"{row['sign_test_p']:.2g}")
+            print(f"    median change {row['median_change']:+.4f} "
+                  f"[{row['change_lo']:+.4f}, {row['change_hi']:+.4f}] kcal/mol, "
+                  f"resampled over molecules")
         if args.summary:
+            if paired:
+                lines.append("")
+                lines.append("arm,reference,n,wins,win_fraction,sign_test_p,"
+                             "median_change,change_lo,change_hi")
+                for row in paired:
+                    lines.append(
+                        f"{row['arm']},{row['reference']},{row['n']},{row['wins']},"
+                        f"{row['win_fraction']:.4f},{row['sign_test_p']:.4g},"
+                        f"{row['median_change']:.4f},{row['change_lo']:.4f},"
+                        f"{row['change_hi']:.4f}")
             pathlib.Path(args.summary).write_text("\n".join(lines) + "\n")
 
 

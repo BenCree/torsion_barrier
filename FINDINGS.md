@@ -189,6 +189,110 @@ different cohort with per-angle relaxation, so those are not a like-for-like row
 
 `cluster/torsion_espaloma_full.sbatch`, job 79460
 
+### 4c. Fine-tuning is a small real harm, not a wash
+
+Paired on the same 3,889 held-out molecules, since both arms shared one split,
+one seed and one head initialisation. Quoting the two medians with separate
+intervals would have measured the width of the pool instead.
+
+Fine-tuning is better on **1,849 of 3,889, 47.5 percent, sign test p = 0.0023**,
+and the paired median change is **+0.0257 [+0.0085, +0.0426] kcal/mol**: worse,
+with an interval excluding zero, for 60 percent more wall clock.
+
+**Neither arm was stopped mid-descent.** Both held a flat validation curve for
+the full 60-epoch patience, drift over the last tenth +0.005 and +0.002. So the
+reversal is not an early-stopping artifact.
+
+**There is no generalisation gap at all.** Validation RMSE 1.724 against a test
+mean of 1.728 for frozen, 1.769 against 1.762 for fine-tuned. The validation
+metric is the MEAN over scans of each scan's own RMSE, which is why it reads far
+above the 1.166 median: the distribution has a long tail and the two statistics
+are not interchangeable. An earlier version of this figure drew the median as a
+reference line under a curve of means, which invents a train-test gap that does
+not exist.
+
+`workflow/plot_training_curves.py`, `workflow/compare_arms.py`,
+`results/training_curves.png`, `results/full_pool_before_after.png`
+
+---
+
+## 4d. What the head fails on, named two ways
+
+A median over a held-out pool is one number over a mixture. The useful form is
+an applicability domain, and two independent routes produce the same one.
+
+**Route one names the chemistry first.** Rotor classes assigned from the driven
+bond's own neighbourhood, each tested against every molecule lacking that tag,
+on the 3,698 regular scans. The permuted-label envelope at matched class sizes
+is 0.132 kcal/mol.
+
+| class | n | RMSE vs the rest | JS vs the rest |
+|---|---|---|---|
+| capped peptide | 155 | **+1.302 [+1.022, +1.432]** | **+0.354 [+0.311, +0.386]** |
+| stereocentre-adjacent | 982 | **+0.516 [+0.440, +0.615]** | **+0.155 [+0.137, +0.177]** |
+| anomeric | 505 | **+0.488 [+0.396, +0.616]** | −0.003 [−0.038, +0.017] |
+| amide | 126 | **+0.401 [+0.203, +0.689]** | −0.021 [−0.082, +0.040] |
+| gauche effect | 235 | **+0.369 [+0.220, +0.576]** | **+0.076 [+0.038, +0.126]** |
+| conjugated | 1258 | −0.044 [−0.125, +0.036] | −0.099 |
+| plain | 1275 | −0.288 | −0.016 |
+| biaryl | 210 | **−0.554 [−0.663, −0.451]** | **−0.144** |
+
+**The two kinds of electronic effect fail differently.** π conjugation is the
+model's best chemistry: biaryl reaches JS 0.145, below espaloma's published
+whole-force-field 0.20. σ* hyperconjugation is its worst: anomeric and gauche
+effect are both worse than the rest with intervals excluding zero.
+
+**And within the failures there are two distinct modes.** Anomeric and amide
+have wrong barrier HEIGHTS and right POPULATIONS: RMSE worse by 0.4 to 0.5 while
+the JS interval spans zero. Stereocentre-adjacent, gauche and peptides are wrong
+in both, which is the profile SHAPE being wrong. That is section 1's phase
+result measured on a trained model rather than argued from architecture: the odd
+component is what those rotors carry and what a fixed-phase form cannot draw.
+
+**Route two names nothing and clusters the cohort.** k-means at k = 40 over the
+same ECFP4 gives 15 clusters of 30 or more covering 92.3 percent of the pool.
+Against a permuted-label envelope of 0.441 kcal/mol, **3 of 15 clear it**, and
+all three are the same chemistry:
+
+| cluster | n | composition | RMSE | vs the rest | JS |
+|---|---|---|---|---|---|
+| 25 | 51 | 92% stereocentre-adjacent, 31% gauche | 2.486 | **+1.366 [+1.034, +1.575]** | 0.655 |
+| 29 | 50 | 94% stereocentre-adjacent, 30% gauche | 2.422 | **+1.303 [+0.972, +1.623]** | 0.628 |
+| 35 | 40 | 78% stereocentre-adjacent | 1.575 | **+0.445 [+0.043, +1.361]** | 0.442 |
+
+The twelve others are unresolved, the four largest among them (n = 690, 693,
+545, 395). **Clustering found nothing the chemistry did not**, which is the
+result the exercise was for.
+
+**Failure is not localised in chemical space.** PCA, t-SNE and UMAP all show the
+error scattered through the main cloud; the first two principal components carry
+9.2 percent of ECFP4 variance between them. The cohort is 2,941 Butina clusters
+at Tanimoto distance 0.4 for 3,698 molecules, four fifths of them singletons, so
+there are barely any neighbourhoods for error to sit in. The three failing
+k-means clusters are the exception and hold together as one island in all three
+projections, which is the test that separates a neighbourhood from a projection
+artifact: cluster 4 at +0.272 is diffuse across half the space in two of them
+and is correspondingly unresolved.
+
+**A confound worth recording, because it reversed a verdict.** A regular scan
+here is 24 points over 345 degrees; 187 of 3,885 are not, some covering 90
+degrees while the QM climbs to 50 kcal/mol, which is a scan that hit a clash
+rather than a torsion profile. They are 4.8 percent of the pool but **24.1
+percent of amide rotors** and 17.3 percent of biaryls, so they do not merely add
+noise, they move some classes and not others. With them in, amide reads
+unresolved at +0.032 [−0.207, +0.310]; with them out it is a failure. The rule
+stratifies and reports both.
+
+The group visible off the main cloud in every projection is the **capped
+peptides**, Ace-Xaa-Yaa-Nme rotamers from the OpenFF protein sets, tagged by
+backbone SMARTS rather than by their `ace-...-rotamer-1` naming. A median of 50
+heavy atoms against the pool's 25, and the single worst group in the cohort at
+JS 0.626, more than double the pool and twice Sage's whole-force-field figure.
+
+`workflow/failure_groups.py`, `workflow/chemical_clusters.py`,
+`results/failure_classes.png`, `results/cluster_projections.png`,
+`results/cluster_forest.png`, `results/failure_gallery.png`
+
 ---
 
 ## 5. Model comparison on full 24-point profiles
@@ -368,6 +472,15 @@ theirs relaxes with the force field at each angle and ours does not, and their
 400 scans are not ours. Within our own cohort and one protocol, Sage's total
 error is JS 0.168 and removing the phase costs 0.118, which is the like-for-like
 version and is the weaker of the two statements.
+
+The same caveat applies to our own head. Its median JS on the held-out pool is
+**0.281 [0.275, 0.289]** over 3,846 molecules, which lands between Sage's 0.30
+and espaloma's 0.20 in that table, on a different cohort, and is therefore worth
+little as stated. A run evaluating the same trained model on TorsionNet500
+itself is in flight (`cluster/torsion_tn500_benchmark.sbatch`, job 79462); **50
+of TorsionNet500's 497 molecules share an InChIKey with our training pool** and
+are excluded by the run, leaving 447. Matching the cohort removes one of the two
+caveats and not both: the relaxation protocol still differs.
 
 All of it is three days of work by one person and has been reviewed by nobody.
 

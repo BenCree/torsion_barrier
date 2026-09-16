@@ -18,6 +18,11 @@ NAGL = "/home/ben/miniforge3/envs/nagl/bin/python"
 MACE = "/home/ben/miniforge3/envs/al_mace/bin/python"
 ESPALOMA = "/home/ben/miniforge3/envs/espaloma/bin/python"
 OPENFE = "/home/ben/miniforge3/envs/openfe2/bin/python"
+# umap-learn and scikit-learn's manifold code live in their own environment
+# rather than being added to `espaloma`, whose pins decide what torch and dgl
+# the training runs against. It also carries rdkit, so the clustering rule needs
+# nothing from the espaloma side beyond the two helper imports.
+UMAP = "/home/ben/miniforge3/envs/umap/bin/python"
 
 
 rule torsiondrives:
@@ -966,6 +971,44 @@ rule mm_baseline:
         """
 
 
+rule reconstruct:
+    """Put a residual-target arm back on the QM axis so it can be compared.
+
+    The reasoning, how the MM baseline comes back by difference without having
+    been stored, and why three metrics rather than one are in
+    `reconstruct_residual.py`'s docstring. What belongs here: without this an
+    arm trained on E_QM - E_MM,no-torsion and an arm trained on E_QM report
+    errors against two different quantities, and putting them in one table would
+    be the kind of comparison that looks like a result and is not.
+
+    CONTROLS. The MM baseline alone is scored on the same rows, so an arm has to
+    beat Sage's own bonded and nonbonded terms with no torsion at all.
+
+    COST. A join and some arithmetic. Seconds, CPU.
+    """
+    input:
+        script="reconstruct_residual.py",
+        qm=f"data/torsiondrives_gen3_{config['limit']}.npz",
+        residual=f"data/residual_gen3_{config['limit']}.npz",
+        residual_profiles="data/profiles_{encoder}_residual.csv",
+        total_profiles="data/profiles_{encoder}_total.csv",
+    output:
+        csv="data/reconstructed_{encoder}.csv",
+    wildcard_constraints:
+        encoder=r"(espaloma|nagl|dpa3)",
+    log:
+        "logs/reconstruct_{encoder}.log",
+    shell:
+        """
+        {MACE} {input.script} \\
+          --qm {input.qm} \\
+          --residual {input.residual} \\
+          --residual-profiles {input.residual_profiles} \\
+          --total-profiles {input.total_profiles} \\
+          --out {output.csv} > {log} 2>&1
+        """
+
+
 rule phased:
     """Does a fitted phase help, with every other choice held identical?
 
@@ -1039,4 +1082,192 @@ rule pose_strain:
         """
         {ESPALOMA} {input.script} --poses {input.poses} \\
           --out {output.csv} --quarantine {output.quarantine} > {log} 2>&1
+        """
+
+
+rule failure_groups:
+    """Which rotor classes the full-pool head cannot do, and how it reads against presto.
+
+    The question, the three controls and why the MMFF94 statistics are medians
+    are in `failure_groups.py`'s docstring. What belongs here: a median RMSE over
+    a held-out pool is one number over a mixture, and the only useful form of it
+    is an applicability domain. If the electronic classes the phase census named,
+    anomeric, conjugated, biaryl, amide, gauche effect, carry the error, that is
+    a statement about chemistry; if permuted class labels of the same sizes
+    produce differences just as large, there is no domain to state.
+
+    THE PERMUTED CONTROL IS NOT OPTIONAL HERE. Several classes hold fewer than
+    a hundred molecules, and a class of that size drawn from one pool moves the
+    median by an amount this cohort produces from nothing. Without the envelope,
+    the smallest classes are exactly the ones that would look most affected.
+
+    COST. Minutes, CPU, on files already on disk. No GPU.
+    """
+    input:
+        script="failure_groups.py",
+        encoder="espaloma_encoder.py",
+        census="phase_census.py",
+        per_molecule="data/espaloma_full/frozen/per_molecule.csv",
+        profiles="data/espaloma_full/frozen/profiles.csv",
+        cache="data/pool_scans.npz",
+    output:
+        table="data/failure_groups.csv",
+        quarantine="data/failure_groups_quarantine.csv",
+        classes="results/failure_classes.png",
+        pca="results/failure_pca.png",
+        gallery="results/failure_gallery.png",
+    log:
+        "logs/failure_groups.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \\
+          --per-molecule {input.per_molecule} \\
+          --profiles {input.profiles} \\
+          --cache {input.cache} \\
+          --table {output.table} \\
+          --quarantine {output.quarantine} \\
+          --class-figure {output.classes} \\
+          --pca-figure {output.pca} \\
+          --gallery-figure {output.gallery} > {log} 2>&1
+        """
+
+
+rule training_curves:
+    """What the two full-pool arms actually did while training.
+
+    The per-molecule table reports where training ENDED. It does not say whether
+    the run converged, whether the kept epoch sat on a plateau or a spike, or
+    how far the validation curve had drifted from the training loss by the time
+    early stopping fired. Those are the questions a reader of a learning curve
+    asks, and the answer changes how much weight the headline carries.
+
+    WHY BOTH ARMS ON ONE AXIS. Frozen kept epoch 188 at 2.72 h and fine-tuned
+    kept epoch 288 at 4.36 h, and fine-tuning ended WORSE on the full pool while
+    costing 60 percent more wall clock. A curve says whether that is overfitting,
+    visible as the validation curve rising while the training loss falls, or a
+    run that simply had not finished.
+
+    COST. Seconds, CPU. No GPU.
+    """
+    input:
+        script="plot_training_curves.py",
+        frozen="data/espaloma_full/frozen/loss.csv",
+        finetuned="data/espaloma_full/finetuned_reference/loss.csv",
+        frozen_molecules="data/espaloma_full/frozen/per_molecule.csv",
+        finetuned_molecules="data/espaloma_full/finetuned_reference/per_molecule.csv",
+    output:
+        figure="results/training_curves.png",
+        table="data/training_curves.csv",
+    log:
+        "logs/training_curves.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \\
+          --loss frozen={input.frozen} finetuned={input.finetuned} \\
+          --per-molecule frozen={input.frozen_molecules} \\
+             finetuned={input.finetuned_molecules} \\
+          --figure {output.figure} \\
+          --table {output.table} > {log} 2>&1
+        """
+
+
+rule full_pool_arms:
+    """Frozen against fine-tuned on the full pool, paired on the same molecules.
+
+    The question, and why the change is measured per molecule rather than
+    between two medians, are in `compare_arms.py`'s docstring. What belongs
+    here: the two arms shared one split and one seed, so every held-out molecule
+    has a frozen and a fine-tuned prediction and the comparison is PAIRED.
+    Quoting the two medians and their separate intervals instead would measure
+    the width of the pool rather than the difference between the arms, which is
+    the mistake this project has already made once on a seed sweep.
+
+    THE ARMS RAN AS SEPARATE ARRAY TASKS, so each wrote its own table with its
+    own `encoder` column. They are concatenated here rather than in either
+    script, because neither script should have to know how the campaign was
+    scheduled.
+
+    COST. Seconds, CPU. No GPU.
+    """
+    input:
+        script="compare_arms.py",
+        frozen_molecules="data/espaloma_full/frozen/per_molecule.csv",
+        finetuned_molecules="data/espaloma_full/finetuned_reference/per_molecule.csv",
+        frozen_profiles="data/espaloma_full/frozen/profiles.csv",
+        finetuned_profiles="data/espaloma_full/finetuned_reference/profiles.csv",
+        frozen_loss="data/espaloma_full/frozen/loss.csv",
+        finetuned_loss="data/espaloma_full/finetuned_reference/loss.csv",
+    output:
+        molecules="data/espaloma_full/both_per_molecule.csv",
+        profiles="data/espaloma_full/both_profiles.csv",
+        loss="data/espaloma_full/both_loss.csv",
+        curves="results/full_pool_curves.png",
+        before_after="results/full_pool_before_after.png",
+        profile_figure="results/full_pool_profiles.png",
+        summary="data/full_pool_arms.csv",
+    log:
+        "logs/full_pool_arms.log",
+    shell:
+        """
+        for pair in "{input.frozen_molecules} {input.finetuned_molecules} {output.molecules}" \
+                    "{input.frozen_profiles} {input.finetuned_profiles} {output.profiles}" \
+                    "{input.frozen_loss} {input.finetuned_loss} {output.loss}"; do
+          set -- $pair
+          head -1 "$1" > "$3"
+          tail -n +2 "$1" >> "$3"
+          tail -n +2 "$2" >> "$3"
+        done
+        {ESPALOMA} {input.script} \\
+          --history {output.loss} \\
+          --per-molecule {output.molecules} \\
+          --profiles {output.profiles} \\
+          --curves {output.curves} \\
+          --before-after {output.before_after} \\
+          --profile-figure {output.profile_figure} \\
+          --summary {output.summary} > {log} 2>&1
+        """
+
+
+rule chemical_clusters:
+    """Does any cluster of this cohort carry the error, found rather than named.
+
+    The question, why Butina rather than k-means and why the clustering is done
+    in fingerprint space rather than in a projection are in
+    `chemical_clusters.py`'s docstring. What belongs here: the class table in
+    `failure_groups` can only find chemistry somebody thought to test for. This
+    tests every cluster of thirty or more, so a failure region nobody named gets
+    named, and a class table that already found everything is confirmed by this
+    finding nothing beyond it.
+
+    THE THREE PROJECTIONS DECIDE NOTHING. PCA, t-SNE and UMAP are drawn from one
+    set of fingerprints and coloured by one set of Butina labels, so they can be
+    compared; every number comes from the 2048-bit space. A cluster tight in one
+    projection and scattered in the other two is that projection's doing, which
+    is the reason for drawing all three rather than picking the flattering one.
+
+    COST. Minutes, CPU. The pairwise Tanimoto matrix over 3,698 molecules is
+    about 6.8 million distances and t-SNE is the slow part. No GPU.
+    """
+    input:
+        script="chemical_clusters.py",
+        encoder="espaloma_encoder.py",
+        census="phase_census.py",
+        per_molecule="data/espaloma_full/frozen/per_molecule.csv",
+        profiles="data/espaloma_full/frozen/profiles.csv",
+        cache="data/pool_scans.npz",
+    output:
+        table="data/chemical_clusters.csv",
+        figure="results/cluster_projections.png",
+        clusters="results/cluster_forest.png",
+    log:
+        "logs/chemical_clusters.log",
+    shell:
+        """
+        {UMAP} {input.script} \\
+          --per-molecule {input.per_molecule} \\
+          --profiles {input.profiles} \\
+          --cache {input.cache} \\
+          --table {output.table} \\
+          --figure {output.figure} \\
+          --cluster-figure {output.clusters} > {log} 2>&1
         """
