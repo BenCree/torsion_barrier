@@ -159,6 +159,38 @@ turned it is indistinguishable from random. `workflow/espaloma_phase_check.py`
 
 ---
 
+## 4b. More data helps this head, and fine-tuning stops helping
+
+The per-bond head on espaloma's embedding, driven bond, scaffold-hashed split
+with both arms holding out identical rows by construction.
+
+| cohort | frozen | encoder fine-tuned |
+|---|---|---|
+| 855 molecules, Gen3 | 1.595 | **1.368** |
+| **15,468 molecules, full pool** | **1.166** | 1.207 |
+
+Held out: 213 and **3,893** scans, zero rows in one arm and not the other. On the
+full pool, rho +0.844 against MMFF94's median 1.866 and a flat profile's 3.135.
+Training 163.5 minutes frozen, 261.7 fine-tuned.
+
+**Two things reverse.** Eighteen times more data took the frozen arm from 1.595
+to 1.166, a 27 percent reduction. This project measured a data-scaling exponent
+of **0.047** from 60 to 604 molecules on the DPA-3.1-3M encoder, which predicts
+essentially no gain; **that exponent does not transfer** to a purpose-trained
+graph encoder at this scale, and any argument resting on it is about DPA3 only.
+
+And fine-tuning the encoder **helped at 855 molecules and hurts at 15,468**,
+1.166 to 1.207, while costing 60 percent more wall clock. With 529 training
+molecules an unfrozen encoder buys capacity; with 11,600 the frozen
+representation is already sufficient and moving it overfits.
+
+For scale, espaloma's own published figure is 1.18 and presto's 0.62, on a
+different cohort with per-angle relaxation, so those are not a like-for-like row.
+
+`cluster/torsion_espaloma_full.sbatch`, job 79460
+
+---
+
 ## 5. Model comparison on full 24-point profiles
 
 296 multi-rotor molecules of the OpenFF pool, driven bond, against QM.
@@ -166,6 +198,11 @@ turned it is indistinguishable from random. `workflow/espaloma_phase_check.py`
 | model | RMSE | min shift | JS | n |
 |---|---|---|---|---|
 | MMFF94 (whole force field) | 0.615 | 0.0° | 0.103 | 268 |
+
+MMFF94's **mean** is not quotable anywhere in this project: on the full pool it
+reads 903.3 kcal/mol against a median of 1.866, because RDKit's perception fails
+on a handful of charged or hypervalent species and returns an astronomic energy
+rather than an error. Medians only.
 | espaloma 0.3.2 | 1.083 | 22.5° | 0.152 | 298 |
 | Sage 2.3.0 | 1.124 | 45.0° | 0.168 | 298 |
 | flat profile | 2.650 | 45.0° | 0.456 | 300 |
@@ -249,7 +286,9 @@ training level. Either way the niche is not there.
 
 **A pretrained atomistic encoder is the wrong choice for this.** DPA-3.1-3M
 costs 12× espaloma's stage 1 per molecule, 450 ms against 1.6 ms across 24
-conformers, and scores no better on the same split.
+conformers, and scores no better on the same split. On the full pool the
+espaloma head reaches 1.166 where the DPA3 arms reached 1.25 on a cohort 18
+times smaller, so the gap is not closed by giving DPA3 the same data either.
 
 **Flat cost in the number of angles is not novel.** It follows from predicting
 the coefficients of a closed-form function of the angle rather than energies at
