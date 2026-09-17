@@ -1271,3 +1271,99 @@ rule chemical_clusters:
           --figure {output.figure} \\
           --cluster-figure {output.clusters} > {log} 2>&1
         """
+
+
+rule presto_comparison:
+    """Our head on TorsionNet500, in the column presto and espaloma report in.
+
+    The question, what it does and does not settle, and why the reference lines
+    are drawn as lines rather than as competing points are in
+    `presto_comparison.py`'s docstring. What belongs here: every JS number this
+    project has put beside presto's Table 1 so far has been on a different
+    cohort. This one is not. The cohort now matches and the protocol still does
+    not, since presto relaxes with the force field at every scan angle and this
+    reads the QM geometry, so the row is comparable in cohort alone and the
+    figure says which of the two caveats has gone.
+
+    THE ARMS ARE ARGUMENTS. The fine-tuned arm of job 79462 runs an hour and a
+    half behind the frozen one, so this takes `name=directory` pairs and reports
+    on whatever has landed rather than refusing until both have.
+
+    COST. Seconds, CPU, on files already pulled. No GPU.
+    """
+    input:
+        script="presto_comparison.py",
+        frozen_molecules="data/tn500_benchmark/frozen/per_molecule.csv",
+        frozen_profiles="data/tn500_benchmark/frozen/profiles.csv",
+        finetuned_molecules="data/tn500_benchmark/finetuned_reference/per_molecule.csv",
+        finetuned_profiles="data/tn500_benchmark/finetuned_reference/profiles.csv",
+    output:
+        table="data/presto_comparison.csv",
+        figure="results/presto_comparison.png",
+    log:
+        "logs/presto_comparison.log",
+    shell:
+        """
+        {ESPALOMA} {input.script} \\
+          --arms frozen=data/tn500_benchmark/frozen \\
+                 finetuned=data/tn500_benchmark/finetuned_reference \\
+          --table {output.table} \\
+          --figure {output.figure} > {log} 2>&1
+        """
+
+
+rule tn500_arms:
+    """Frozen against fine-tuned inside job 79462, paired on the same molecules.
+
+    WHY THIS EXISTS SEPARATELY FROM `full_pool_arms`. That rule pairs the two
+    arms of job 79460 and found fine-tuning a small harm: 1,849 wins of 3,889,
+    sign test p = 0.0023. Job 79462 reran the same two arms under the same seed
+    and hyperparameters to add TorsionNet500, and the sign REVERSED. Pairing
+    inside each run is still the right comparison; what the two rules together
+    show is that the between-run difference is larger than the between-arm one,
+    which no single run can say and which neither rule alone would have caught.
+
+    The fine-tuned arm of 79462 stopped at epoch 399 of a 400 cap with its best
+    validation on the last epoch, so it was epoch-limited rather than converged;
+    in 79460 the same configuration plateaued at 288. That is the mechanism to
+    check before either sign is believed.
+
+    COST. Seconds, CPU. No GPU.
+    """
+    input:
+        script="compare_arms.py",
+        frozen_molecules="data/tn500_benchmark/frozen/per_molecule.csv",
+        finetuned_molecules="data/tn500_benchmark/finetuned_reference/per_molecule.csv",
+        frozen_profiles="data/tn500_benchmark/frozen/profiles.csv",
+        finetuned_profiles="data/tn500_benchmark/finetuned_reference/profiles.csv",
+        frozen_loss="data/tn500_benchmark/frozen/loss.csv",
+        finetuned_loss="data/tn500_benchmark/finetuned_reference/loss.csv",
+    output:
+        molecules="data/tn500_benchmark/both_per_molecule.csv",
+        profiles="data/tn500_benchmark/both_profiles.csv",
+        loss="data/tn500_benchmark/both_loss.csv",
+        curves="results/tn500_curves.png",
+        before_after="results/tn500_before_after.png",
+        profile_figure="results/tn500_profiles.png",
+        summary="data/tn500_arms.csv",
+    log:
+        "logs/tn500_arms.log",
+    shell:
+        """
+        for pair in "{input.frozen_molecules} {input.finetuned_molecules} {output.molecules}" \
+                    "{input.frozen_profiles} {input.finetuned_profiles} {output.profiles}" \
+                    "{input.frozen_loss} {input.finetuned_loss} {output.loss}"; do
+          set -- $pair
+          head -1 "$1" > "$3"
+          tail -n +2 "$1" >> "$3"
+          tail -n +2 "$2" >> "$3"
+        done
+        {ESPALOMA} {input.script} \\
+          --history {output.loss} \\
+          --per-molecule {output.molecules} \\
+          --profiles {output.profiles} \\
+          --curves {output.curves} \\
+          --before-after {output.before_after} \\
+          --profile-figure {output.profile_figure} \\
+          --summary {output.summary} > {log} 2>&1
+        """

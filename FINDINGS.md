@@ -167,7 +167,13 @@ with both arms holding out identical rows by construction.
 | cohort | frozen | encoder fine-tuned |
 |---|---|---|
 | 855 molecules, Gen3 | 1.595 | **1.368** |
-| **15,468 molecules, full pool** | **1.166** | 1.207 |
+| **15,468 molecules, full pool**, job 79460 | **1.166** | 1.207 |
+| **15,468 molecules, full pool**, job 79462 | 1.196 | **1.123** |
+
+**The second row of that table does not reproduce.** See 4c: a rerun of the same
+two arms reverses which is ahead, so the paragraph below about fine-tuning
+hurting at scale is withdrawn. The data-scaling statement in the next paragraph
+is unaffected, since 1.595 to 1.166 and 1.595 to 1.196 are the same conclusion.
 
 Held out: 213 and **3,893** scans, zero rows in one arm and not the other. On the
 full pool, rho +0.844 against MMFF94's median 1.866 and a flat profile's 3.135.
@@ -179,29 +185,48 @@ of **0.047** from 60 to 604 molecules on the DPA-3.1-3M encoder, which predicts
 essentially no gain; **that exponent does not transfer** to a purpose-trained
 graph encoder at this scale, and any argument resting on it is about DPA3 only.
 
-And fine-tuning the encoder **helped at 855 molecules and hurts at 15,468**,
-1.166 to 1.207, while costing 60 percent more wall clock. With 529 training
-molecules an unfrozen encoder buys capacity; with 11,600 the frozen
-representation is already sufficient and moving it overfits.
+Fine-tuning the encoder appeared to help at 855 molecules and hurt at 15,468,
+which is what this section claimed. **That is withdrawn**: the rerun in 4c puts
+fine-tuning ahead at 15,468, and the honest statement is that this design cannot
+separate the two arms at this cohort size. It does cost 60 to 120 percent more
+wall clock in every run.
 
 For scale, espaloma's own published figure is 1.18 and presto's 0.62, on a
 different cohort with per-angle relaxation, so those are not a like-for-like row.
 
 `cluster/torsion_espaloma_full.sbatch`, job 79460
 
-### 4c. Fine-tuning is a small real harm, not a wash
+### 4c. CORRECTION: the frozen against fine-tuned comparison does not survive a rerun
 
-Paired on the same 3,889 held-out molecules, since both arms shared one split,
-one seed and one head initialisation. Quoting the two medians with separate
-intervals would have measured the width of the pool instead.
+This section previously reported that fine-tuning was a small real harm. A
+second run of the same two arms reverses the sign, and both runs are individually
+significant. **The between-run difference is larger than the between-arm one,
+and no single run could have said so.**
 
-Fine-tuning is better on **1,849 of 3,889, 47.5 percent, sign test p = 0.0023**,
-and the paired median change is **+0.0257 [+0.0085, +0.0426] kcal/mol**: worse,
-with an interval excluding zero, for 60 percent more wall clock.
+| | frozen | fine-tuned | paired sign test | paired median change |
+|---|---|---|---|---|
+| job 79460 | **1.166** | 1.207 | 1,849 of 3,889 (47.5%), p = 0.0023 | **+0.0257 [+0.0085, +0.0426]** |
+| job 79462 | 1.196 | **1.123** | 2,434 of 4,336 (56.1%), p = 6.8e-16 | **−0.0621 [−0.0741, −0.0457]** |
 
-**Neither arm was stopped mid-descent.** Both held a flat validation curve for
-the full 60-epoch patience, drift over the last tenth +0.005 and +0.002. So the
-reversal is not an early-stopping artifact.
+Same seed, same hyperparameters, same split rule, same code. Both pairings are
+correct: the arms within a run share one split and one head initialisation, so
+pairing is the right comparison and each interval excludes zero. What neither
+run could show on its own is that running it again flips the answer.
+
+**The mechanism is visible in the epoch counts.** The fine-tuned arm plateaued
+at epoch 288 in 79460 and ran to **epoch 399 of a 400 cap in 79462 with its best
+validation on the final epoch**, so in the second run it was stopped by the
+budget rather than by convergence. Frozen stopped at 188 and 167. An arm whose
+stopping point moves by 111 epochs between identical invocations is not being
+measured at convergence, and any claim about what fine-tuning buys has to wait
+on a run that reaches it.
+
+An earlier version of this section said "neither arm was stopped mid-descent",
+which was true of 79460 and is false of 79462.
+
+**What does survive both runs.** Every number in 4d, which comes from one run
+and describes where the error sits rather than which arm is ahead. And both arms
+in both runs beat MMFF94's 1.855 and the flat profile's 3.129 by a wide margin.
 
 **There is no generalisation gap at all.** Validation RMSE 1.724 against a test
 mean of 1.728 for frozen, 1.769 against 1.762 for fine-tuned. The validation
@@ -292,6 +317,55 @@ JS 0.626, more than double the pool and twice Sage's whole-force-field figure.
 `workflow/failure_groups.py`, `workflow/chemical_clusters.py`,
 `results/failure_classes.png`, `results/cluster_projections.png`,
 `results/cluster_forest.png`, `results/failure_gallery.png`
+
+---
+
+## 4e. On TorsionNet500 itself, the cohort presto and espaloma report in
+
+Every JS number this project had put beside presto's Table 1 was on a different
+cohort. This one is not: the same trained model scores TorsionNet500 in the same
+run that scores our own held-out pool, so a difference between them is the
+cohorts differing rather than two training runs differing.
+
+**50 of TorsionNet500's 497 molecules share an InChIKey with our training pool**
+and are dropped by the run itself, leaving 447. Comparing against a published
+benchmark while having trained on a tenth of it is silent without that check.
+
+| | JS at 500 K, TorsionNet500 |
+|---|---|
+| Sage | 0.30 |
+| **ours, frozen** | **0.274 [0.255, 0.292]** |
+| **ours, fine-tuned** | **0.257 [0.224, 0.273]** |
+| espaloma | 0.20 |
+| presto | 0.12 |
+| AceFF 2.0 | 0.09 |
+
+Inside Sage, behind espaloma, presto and AceFF. **The cohort now matches and the
+protocol still does not**: presto relaxes with the force field at every scan
+angle and our head reads the QM geometry and predicts its energy. One of the two
+caveats is gone, not both, and the figure draws those values as reference lines
+rather than as competing points for that reason.
+
+**The two cohorts agree, which retires the cross-cohort worry rather than only
+narrowing it.** TorsionNet500 gives 0.274 [0.255, 0.292] and our pool 0.284
+[0.277, 0.293] for the frozen arm, overlapping intervals from one model in one
+run; profile RMSE 1.251 against 1.190. So the earlier cross-cohort comparisons
+were not misleading, which could not have been known without running this.
+Controls on the benchmark: MMFF94 1.806 kcal/mol, flat profile 3.034, ours 1.251.
+
+**The failure mode is quantified, not just visible.** The barrier slope is
+**0.594** on TorsionNet500 and 0.612 on our pool for the frozen arm, 0.707 and
+0.678 fine-tuned: the head places minima correctly and compresses amplitude by
+about a third to two fifths. That is what least squares does to a skewed target,
+and it is the mechanism behind the split in 4d where anomeric rotors have wrong
+barrier heights and right populations.
+
+The retrain reproduced the pool median to **1.196 against 79460's 1.166**, inside
+the 0.05 tolerance declared before the run and not identical. See 4c: that
+0.030 is the same run-to-run variation that reverses the arm comparison.
+
+`cluster/torsion_tn500_benchmark.sbatch`, job 79462,
+`workflow/presto_comparison.py`, `results/presto_comparison.png`
 
 ---
 
@@ -473,14 +547,7 @@ theirs relaxes with the force field at each angle and ours does not, and their
 error is JS 0.168 and removing the phase costs 0.118, which is the like-for-like
 version and is the weaker of the two statements.
 
-The same caveat applies to our own head. Its median JS on the held-out pool is
-**0.281 [0.275, 0.289]** over 3,846 molecules, which lands between Sage's 0.30
-and espaloma's 0.20 in that table, on a different cohort, and is therefore worth
-little as stated. A run evaluating the same trained model on TorsionNet500
-itself is in flight (`cluster/torsion_tn500_benchmark.sbatch`, job 79462); **50
-of TorsionNet500's 497 molecules share an InChIKey with our training pool** and
-are excluded by the run, leaving 447. Matching the cohort removes one of the two
-caveats and not both: the relaxation protocol still differs.
+That caveat is now half retired for our own head. See section 4e.
 
 All of it is three days of work by one person and has been reviewed by nobody.
 
